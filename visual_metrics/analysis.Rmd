@@ -1,0 +1,753 @@
+---
+title: "Comparing Visual Metrics To Navigation Timings"
+author: "Corey Dow-Hygelund, Mozilla Data Science"
+date: 'Last Updated: `r format(Sys.time(), "%B %d, %Y")`'
+output: 
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+---
+
+# tl;dr
+Experiments were running comparing the existing, computational light navigation timings to visual metrics of Fenix. The latter utilize video analysis to give a better measurement of user perceived page load, than navigation timings. However, visual metrics cannot be utilized in-the-wild due to their computational demand. This work investigates the possibility of using the navigation timings as a proxy for one or more of the visual metrics. Simple linear regressions were fitted to three navigation timings (`loadtime`, `firstPaint`, and `DOMContentLoaded`) to four visual metrics. Overall, the results suggest that these timings could be used; however additional covariates need to be added to lower the prediction error for production use-cases. In addition, many of the visual metrics are not adequately explained by a linear model, having residuals dependent upon the visual metric value. Therefore, non-linear terms and/or different predictive modeling architectures need to be tested. Adding the number of trackers could be added, as tracking protection significantly helps the results for several URLs known to contain large numbers of trackers. It would be interesting to further investigation of measured navigation timings and how these are impacted by trackers and subsequent blockage by tracking protection.
+
+
+# Data Loading
+
+acresky provided the dataset as two RData files, containing dataframes of the experimental results. 
+
+```{r library_imports, message=FALSE, warning=FALSE, echo=FALSE}
+library(corrplot)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(kableExtra)
+```
+
+Both datasets are named `df`: load one, rename, then load the other.
+```{r data_import}
+load('data/live.RData')
+
+df_no_lat <- df
+
+load('data/live_added_latency.RData')
+```
+
+Focus on the `live_added_latency` dataset first. 
+
+```{r summary, echo=FALSE}
+summary(df)
+#knitr::kable(summary(df)) 
+# %>%
+#   kable_styling() %>%
+#   scroll_box(width = "750px", height = "200px")
+```
+
+Data is nice and clean! No missing values, no sample imbalances, no insane outliers. Good way to spend a Friday afternoon.
+
+```{r covariate_defs, echo=FALSE}
+visual_metrics <- c(
+  'firstVisualChange',
+  'visualComplete85',
+  'speedIndex',
+  'contentfulSpeedIndex',
+  'perceptualSpeedIndex')
+
+nav_timings <- c(
+  "firstPaint",
+  "responseStart",
+  "DOMContentLoaded",
+  "loadtime"
+)
+
+# reorder the dataframes for ease in visualization
+df <- df[, c('mode', 'url', nav_timings, visual_metrics)]
+df_no_lat <- df_no_lat[, c('mode', 'url', nav_timings, visual_metrics)]
+```
+
+# Correlation: Latency Added
+
+Focus on the network latency added data first. 
+
+Let's look into correlation of these visual metrics across all browser configurations. 
+
+```{r corrplot, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df %>% select(-c(mode, url))), method = 'pie', type = 'upper') 
+# type = 'upper')
+```
+
+`loadtime` has the highest degree of correlation with the visual metrics. `responseStart` is the least. 
+
+See if this changes at all across modes
+
+## Fenix: No TP
+
+```{r corrplot_fenix, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df %>% filter(mode == 'fenix_none') %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df %>% select(-c(mode, url))), method = 'pie', type = 'upper') 
+```
+
+## Fenix - Strict 
+
+```{r corrplot_fenix_strict, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df %>% filter(mode == 'fenix_strict') %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df %>% filter(mode == 'fenix_strict') %>% select(-c(mode, url))), method = 'pie', type = 'upper')
+```
+
+Interesting correlation increases with for navigation timings with increasing TP.
+
+## Chrome
+
+```{r corrplot_chrome, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df %>% filter(mode == 'chrome') %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df %>% filter(mode == 'chrome') %>% select(-c(mode, url))), method = 'pie', type = 'upper')
+```
+
+Interesting `loadtime` decreases for Chrome but `firstPaint` increases. 
+
+# Modeling - Latency Added
+
+Above results suggest that `mode` plays apart in the relationship between navigation timings. Therefore, look into build a simple linear regresson model with just `fenix_strict` records, with the response `perceptualSpeedIndex` as it has highest correlation. Also, drop `responseStart` as its utility is questionable. 
+
+## perceptualSpeedIndex
+
+### `fenix-strict`
+Straight-up linear regression with all data.
+
+```{r linear_regression}
+lm_fenix_strict <- df %>%
+  filter(mode == 'fenix_strict') %>%
+  lm(formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime, data = .)
+plot(lm_fenix_strict)
+```
+
+```{r lm_summary, echo=FALSE}
+summary(lm_fenix_strict)
+```
+
+```{r lm_plt, echo=FALSE}
+ggplot(df %>% 
+         filter(mode == 'fenix_strict') %>% 
+         mutate(predictions = predict(lm_fenix_strict)), aes(perceptualSpeedIndex, predictions)) +
+  geom_point() + 
+  geom_abline(slope = 1) + 
+  theme_bw()
+```
+
+This looks better than expected. See how this holds up with a cross-validation, where we split out by URL to minimize information leakage.
+
+```{r cv_defined}
+# sample by url to minimize info leakage
+urls <- unique(df$url)
+n_train <- round(length(urls)*0.75)
+
+cv_linear_model <- function(df, formula, response){
+  cv <- NULL
+  for (i in 1:10){
+    # train/test samples
+    train_urls <- sample(urls, n_train)
+    train <- df %>% 
+      filter(url %in% train_urls) 
+    test <- df %>% 
+      filter(!url %in% train_urls)
+    # fit model
+    lm_cv <- lm(formula = formula, data = train) 
+    cv <- rbind(cv, data.frame(response = test[[response]],
+                             prediction = predict(lm_cv, test),
+                             fold = i,
+                             url = test$url))
+  }
+  cv <- cv %>%
+    mutate(residual = (prediction-response)/response)
+  return(cv)
+}
+
+```
+
+
+```{r lm_cv_fenix_strict, echo=FALSE}
+response <- 'perceptualSpeedIndex'
+cv <- cv_linear_model(df %>% filter(mode == 'fenix_strict'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+Not terible, though not great. Definitely there is a solid trend, and does suggest adding more covariates could help. Add in `responseStart` for fun.
+
+```{r lm_cv_fenix_strict_all, echo=FALSE}
+cv <- cv_linear_model(df %>% filter(mode == 'fenix_strict'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+
+```
+
+```{r lm_cv_fenix_strict_all_plt, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+Not interesting, as expected.
+
+### `fenix-none`
+
+Let's determine how tp influence the result. 
+
+```{r lm_cv_fenix_none}
+cv <- cv_linear_model(df %>% filter(mode == 'fenix_none'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      'perceptualSpeedIndex') %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+Oh wow! The model severly underpredicts for epsn and cnn!
+
+### `fenix` All
+
+Throw em both together
+
+```{r lm_cv_fenix_al}
+cv <- cv_linear_model(df %>% filter(mode != 'chrome'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      'perceptualSpeedIndex') %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_all_plt, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 8000))
+```
+
+CNN and ESPN are real problems. It appears, the lists help navigation timings reflect better what a user perceives.
+
+Also, the linear model doesn't explain the data: the prediction error is much higher for low `perceptualSpeedIndex`, and decreases for higher values. 
+
+Let's add in some interaction terms to see if it helps, though I have little hope. 
+
+```{r lm_cv_fenix_all_inter, echo=FALSE,}
+formula <- perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime + loadtime*DOMContentLoaded + firstPaint*DOMContentLoaded + firstPaint*loadtime
+cv <- cv_linear_model(df %>% filter(mode != 'chrome'), 
+                      formula = formula,
+                      'perceptualSpeedIndex') %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_all_plt_inter, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 8000))
+```
+
+## contentfulSpeedIndex
+
+Repeat for `contentfulSpeedIndex`
+
+```{r lm_cv_fenix_strict_contentfulSpeedIndex, echo=FALSE}
+response <- 'contentfulSpeedIndex'
+cv <- cv_linear_model(df %>% filter(mode == 'fenix_strict'), 
+                      formula = contentfulSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_contentfulSpeedIndex, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+CNN again is underpredicting. 
+
+### `fenix` All
+
+Throw em both together
+
+```{r lm_cv_fenix_all_contentfulSpeedIndex, echo=FALSE}
+cv <- cv_linear_model(df %>% filter(mode != 'chrome'), 
+                      formula = contentfulSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_contentfulSpeedIndex, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 8000))
+```
+
+## firstVisualChange
+
+```{r lm_cv_fenix_strict_firstVisualChange, echo=FALSE}
+response <- 'firstVisualChange'
+cv <- cv_linear_model(df %>% filter(mode == 'fenix_strict'), 
+                      formula = firstVisualChange ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_firstVisualChange, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+### `fenix` All
+
+```{r lm_cv_fenix_all_firstVisualChange, echo=FALSE}
+cv <- cv_linear_model(df %>% filter(mode != 'chrome'), 
+                      formula = firstVisualChange ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_firstVisualChange, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() 
+```
+
+## visualComplete85
+
+```{r lm_cv_fenix_strict_visualComplete85, echo=FALSE}
+response <- 'visualComplete85'
+cv <- cv_linear_model(df %>% filter(mode == 'fenix_strict'), 
+                      formula = visualComplete85 ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_visualComplete85, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+Skewed residuals.
+
+### `fenix` All
+
+```{r lm_cv_fenix_all_visualComplete85, echo=FALSE}
+cv <- cv_linear_model(df %>% filter(mode != 'chrome'), 
+                      formula = visualComplete85 ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_visualComplete85, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 8000))
+```
+
+And very skewed residuals. 
+## speedIndex
+
+```{r lm_cv_fenix_strict_speedIndex, echo=FALSE}
+response <- 'speedIndex'
+cv <- cv_linear_model(df %>% filter(mode == 'fenix_strict'), 
+                      formula = speedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_speedIndex, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+### `fenix` All
+
+
+```{r lm_cv_fenix_all_speedIndex, echo=FALSE}
+cv <- cv_linear_model(df %>% filter(mode != 'chrome'), 
+                      formula = visualComplete85 ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_speedIndex, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 8000))
+```
+
+# Correlation: No Added Latency
+
+Perform the same analysis as above with no latency added
+
+```{r summary_no_lat, echo=FALSE}
+summary(df_no_lat)
+# knitr::kable(summary(df_no_lat)) 
+#%>%
+#   kable_styling() %>%
+#  scroll_box(width = "750px", height = "200px")
+```
+
+```{r corrplot_nolat, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df_no_lat_no_lat %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df_no_lat %>% select(-c(mode, url))), method = 'pie', type = 'upper') 
+# type = 'upper')
+```
+
+`loadtime` now is very uncorrelated to visual metrics, other than `perceptualSpeedIndex`. It is also really uncorrelated with the other navigation timings. `DomContentLoaded` is the only navigation metric unaffected by the removal of added network latency. This is due to `fenix_none` as seen below. 
+
+## Fenix: No TP
+
+
+```{r corrplot_fenix_nolat, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df_no_lat %>% filter(mode == 'fenix_none') %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df_no_lat %>% select(-c(mode, url))), method = 'pie', type = 'upper') 
+```
+
+## Fenix - Strict 
+
+The strict list dataset is similar without latency added. 
+
+```{r corrplot_fenix_strict_nolat, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df_no_lat %>% filter(mode == 'fenix_strict') %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df_no_lat %>% filter(mode == 'fenix_strict') %>% select(-c(mode, url))), method = 'pie', type = 'upper')
+```
+
+Interesting correlation increases with for navigation timings with increasing TP.
+
+## Chrome
+
+```{r corrplot_chrome_nlat, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+# corrplot(cor(df_no_lat %>% filter(mode == 'chrome') %>% select(-c(mode, url))), method = 'ellipse', order = 'hclust', addrect = 2) 
+corrplot(cor(df_no_lat %>% filter(mode == 'chrome') %>% select(-c(mode, url))), method = 'pie', type = 'upper')
+```
+
+# Modeling: No Added Latency
+
+## perceptualSpeedIndex
+
+### `fenix-strict`
+
+```{r linear_regression_nolat}
+lm_fenix_strict <- df_no_lat %>%
+  filter(mode == 'fenix_strict') %>%
+  lm(formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime, data = .)
+plot(lm_fenix_strict)
+```
+
+```{r}
+summary(lm_fenix_strict)
+```
+
+```{r, echo=FALSE}
+ggplot(df_no_lat %>% 
+         filter(mode == 'fenix_strict') %>% 
+         mutate(predictions = predict(lm_fenix_strict)), aes(perceptualSpeedIndex, predictions)) +
+  geom_point() + 
+  geom_abline(slope = 1) + 
+  theme_bw()
+```
+
+
+```{r lm_cv_fenix_strict_nolat, echo=FALSE}
+response <- 'perceptualSpeedIndex'
+cv <- cv_linear_model(df_no_lat %>% filter(mode == 'fenix_strict'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 6000))
+```
+
+
+```{r lm_cv_fenix_strict_all_nolat, echo=FALSE}
+cv <- cv_linear_model(df_no_lat %>% filter(mode == 'fenix_strict'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -fold)
+
+```
+
+```{r lm_cv_fenix_strict_all_plt_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 6000))
+```
+
+### `fenix-none`
+
+```{r lm_cv_fenix_none_nolat}
+cv <- cv_linear_model(df_no_lat %>% filter(mode == 'fenix_none'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000)) 
+```
+
+These residuals are highly skewed.
+
+### `fenix` All
+
+```{r lm_cv_fenix_all_nolat, echo=FALSE}
+cv <- cv_linear_model(df_no_lat %>% filter(mode != 'chrome'), 
+                      formula = perceptualSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions 
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_all_plt_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 8000))
+```
+
+## contentfulSpeedIndex
+
+Repeat for `contentfulSpeedIndex`
+
+```{r lm_cv_fenix_strict_contentfulSpeedIndex_nolat, echo=FALSE}
+response <- 'contentfulSpeedIndex'
+cv <- cv_linear_model(df_no_lat %>% filter(mode == 'fenix_strict'), 
+                      formula = contentfulSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_contentfulSpeedIndex_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+### `fenix` All
+
+
+
+```{r lm_cv_fenix_all_contentfulSpeedIndex_nolat, echo=FALSE}
+cv <- cv_linear_model(df_no_lat %>% filter(mode != 'chrome'), 
+                      formula = contentfulSpeedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_contentfulSpeedIndex_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 8000))
+```
+
+## firstVisualChange
+
+```{r lm_cv_fenix_strict_firstVisualChange_nolat, echo=FALSE}
+response <- 'firstVisualChange'
+cv <- cv_linear_model(df_no_lat %>% filter(mode == 'fenix_strict'), 
+                      formula = firstVisualChange ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_firstVisualChange_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 8000))
+```
+
+### `fenix` All
+
+
+
+```{r lm_cv_fenix_all_firstVisualChange_nolat, echo=FALSE}
+cv <- cv_linear_model(df_no_lat %>% filter(mode != 'chrome'), 
+                      formula = firstVisualChange ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_firstVisualChange_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() 
+```
+
+## visualComplete85
+
+```{r lm_cv_fenix_strict_visualComplete85_nolat, echo=FALSE}
+response <- 'visualComplete85'
+cv <- cv_linear_model(df_no_lat %>% filter(mode == 'fenix_strict'), 
+                      formula = visualComplete85 ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_visualComplete85_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 6000))
+```
+
+### `fenix` All
+
+```{r lm_cv_fenix_all_visualComplete85_nolat, echo=FALSE}
+cv <- cv_linear_model(df_no_lat %>% filter(mode != 'chrome'), 
+                      formula = visualComplete85 ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_visualComplete85_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 6000))
+```
+
+## speedIndex
+
+```{r lm_cv_fenix_strict_speedIndex_nolat, echo=FALSE}
+response <- 'speedIndex'
+cv <- cv_linear_model(df_no_lat %>% filter(mode == 'fenix_strict'), 
+                      formula = speedIndex ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_strict_plt_speedIndex_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  xlab(response) + xlim(c(0, 6000))
+```
+
+### `fenix` All
+
+```{r lm_cv_fenix_all_speedIndex_nolat, echo=FALSE}
+cv <- cv_linear_model(df_no_lat %>% filter(mode != 'chrome'), 
+                      formula = visualComplete85 ~ firstPaint + DOMContentLoaded + loadtime,
+                      response) %>% filter(abs(prediction) <= 10000) %>% # filter out the really bad predictions
+  gather('metric', 'value', -response, -url, -fold)
+```
+
+```{r lm_cv_fenix_none_plt_speedIndex_nolat, echo=FALSE, warning=FALSE, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() +
+  xlab(response) + xlim(c(0, 6000))
+```
+

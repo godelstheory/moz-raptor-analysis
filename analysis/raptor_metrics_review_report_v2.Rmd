@@ -332,7 +332,7 @@ ggplot(df_ps_agg1, aes(run_datetime, mean_p_fcp_lt)) +
   facet_grid(rows = vars(run_suite)) + #, scales = 'free') +
   geom_ribbon(aes(ymin=mean_p_fcp_lt-std_p_fcp_lt, ymax=mean_p_fcp_lt+std_p_fcp_lt), alpha=0.4) + 
   theme_bw() + 
-  labs(y = 'Score: Load Time * FCP', x = 'Build Date', title = 'Feburary Reference: Windows 10-64 p score')
+  labs(y = 'Score: Load Time * FCP', x = 'Build Date', title = 'End of May Reference: Windows 10-64 p score')
 ```
 
 # Run Suite Aggregation
@@ -343,12 +343,12 @@ ggplot(br_ps_fcp_lt_f, aes(date, score)) +
   geom_point() + 
   geom_ribbon(aes(ymin=score-sd, ymax=score+sd), alpha=0.4) + 
   theme_bw() +
-  labs(x = 'Build Date', y = 'Score: Load Time * FCP', title = 'Feburary Reference: Windows 10-64 Build Scores') 
+  labs(x = 'Build Date', y = 'Score: Load Time * FCP', title = 'End of May Reference: Windows 10-64 Build Scores') 
 ```
 
 Characteristics to note:
 
-* Large jump in the middle of Feburary: this is observed across several `run_suite`
+* Large jump in the middle of February: this is observed across several `run_suite`
      + Observed across several `run_suite` in the timings
      + Due to Mitmproxy snapshots being updated on this date.
 * Small drop at the beginning of May.
@@ -372,7 +372,7 @@ ggplot(df_ps_agg1_long, aes(run_datetime, measure)) +
   facet_grid(rows = vars(run_suite)) + #, scales = 'free') +
   theme_bw() + 
   theme(legend.position="top") + 
-  labs(x = 'Build Date', y = 'Score', title = 'Feburary Reference: Windows 10-64 Build Scores')
+  labs(x = 'Build Date', y = 'Score', title = 'End of May Reference: Windows 10-64 Build Scores')
 ```
 
 ```{r, echo=FALSE, warning=FALSE, message=FALSE}
@@ -403,7 +403,7 @@ ggplot(br_ps_full, aes(date, score)) +
   geom_point(aes(color = aggregation)) + 
   theme_bw() + 
   theme(legend.position="top") + 
-  labs(x = 'Build Date', y = 'Score', title = 'Feburary Reference: Windows 10-64 Build Scores') 
+  labs(x = 'Build Date', y = 'Score', title = 'End of May Reference: Windows 10-64 Build Scores') 
   
 ```
 
@@ -530,7 +530,7 @@ long_files <- c('data/activedata_125d_v5_windows10_aarch64_long.csv', 'data/acti
     geom_point() + 
     geom_ribbon(aes(ymin=score-sd, ymax=score+sd), alpha=0.4) + 
     theme_bw() +
-    labs(x = 'Build Date', y = 'Score: Load Time * FCP', title = paste('Feburary Reference:', platform)) )
+    labs(x = 'Build Date', y = 'Score: Load Time * FCP', title = paste('End of May Reference:', platform)) )
 }
 ```
 
