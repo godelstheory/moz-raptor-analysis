@@ -12,6 +12,7 @@ output:
 # tl;dr
 Experiments were running comparing the existing, computational light navigation timings to visual metrics of Fenix. The latter utilize video analysis to give a better measurement of user perceived page load, than navigation timings. However, visual metrics cannot be utilized in-the-wild due to their computational demand. This work investigates the possibility of using the navigation timings as a proxy for one or more of the visual metrics. Simple linear regressions were fitted to three navigation timings (`loadtime`, `firstPaint`, and `DOMContentLoaded`) to four visual metrics. Overall, the results suggest that these timings could be used for `perceptualSpeedIndex`; however additional covariates need to be added to lower the prediction error for production use-cases. In addition, many of the visual metrics are not adequately explained by a linear model, having residuals dependent upon the visual metric value. Therefore, non-linear terms and/or different predictive modeling architectures need to be tested. Adding the number of trackers should be added, as tracking protection significantly helps the results for several URLs known to contain large numbers of trackers. It would be interesting to further investigation of measured navigation timings and how these are impacted by trackers and subsequent blockage by tracking protection.
 
+**NOTE**: [Link](https://metrics.mozilla.com/protected/cdowhygelund/visual_metrics_nav_timings.Rmd) to code generating report
 
 # Data Loading
 
