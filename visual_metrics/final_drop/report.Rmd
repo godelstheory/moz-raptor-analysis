@@ -1,0 +1,685 @@
+---
+title: 'Visual Metrics And Navigation Timings: RUMSpeedIndex and Network Metrics'
+author: "Corey Dow-Hygelund"
+date: 'Last Updated: `r format(Sys.time(), "%B %d, %Y")`'
+output:
+  html_document:
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+---
+
+```{r library_imports, message=FALSE, warning=FALSE, echo=FALSE}
+library(corrplot)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(funModeling)
+library(cowplot)
+library(ggridges)
+library(Boruta)
+library(viridis)
+library(caret)
+library(stringr)
+library(plotly)
+```
+
+
+Focus:
+* On second drop dataset. 
+  - rumtimings helpful but not the best
+* Webpagetest is useful how?
+
+* data cleaning: note that there is an anomalous point at large domcontentloaded
+
+
+**TODO**: Utilize residual method! For plotting purposes
+
+
+# Process
+Model idea: focus on full page load covariates, and use remain timings, durations, and resource usage to correct.
+
+1. Review correlations between fields and `speedIndex`
+2. Remove unwarrented features
+3. Generate new features
+4. Perform feature selection to narrow covariate space
+5. Perform leave-one-out cross validation w.r.t. URI
+6. Validation against another dataset
+
+# Feature Generation
+* loadTime (or other page loads) - responseStart
+* responseEnd - responseStart
+
+
+# tl;dr
+
+<statement about utility in calculating vis metrics in wild>. This report expands on previous work <  need link >
+* Given two dataset drops
+* Fit regression models
+* apply this to a different dataset to determine model performance
+
+
+
+# Datasets{.tabset}
+
+Two datasets were provided in early 2020 by Andrew Creskey that contain in-house, live-site testing of a range of URLs for various mobile Firefox versions. The datasets have identical measurements, save the inclusion of `rumSpeedIndex` in the latter dataset. However, they differ on the mobile app version, and URLs tested.
+
+Number of measurements for each mode is the same.
+
+
+< 5 visual metrics differing in how visual completeness is defined >
+(maybe list these out with definitions!!!!)
+
+
+```{r data_import, echo=FALSE, warning=FALSE}
+load('livesites_withNetworkMetrics.RData')
+df_0120 <- df 
+
+load('data_rumSpeedIndex.RData')
+df_0220 <- df 
+
+df <- df_0220 %>%
+  bind_rows(df_0120) %>%
+  mutate(mode = as.factor(mode)) %>%
+  mutate(url = as.factor(url))
+
+visual_metrics <- sort(
+  c(
+    'firstVisualChange',
+    'visualComplete85',
+    'speedIndex',
+    'contentfulSpeedIndex',
+    'perceptualSpeedIndex'
+    )
+)
+
+nav_timings <- sort(names(df)[!names(df) %in% c('mode', 'url', visual_metrics)])
+
+df_0220 <- df_0220 %>% 
+  filter(DOMContentLoaded < 10000)
+
+df_0220_long <- df_0220 %>%
+  gather('vis_metric', 'vis_metric_value', -nav_timings, -mode, -url) %>%
+  gather('nav_timing', 'nav_timing_value', -vis_metric, -vis_metric_value, -mode, -url)
+
+urls <- unique(df_0220$url)
+```
+
+## Mode
+
+```{r mode, echo=FALSE}
+knitr::kable(data.frame(Mode = sort(unique(df$mode))) %>%
+               mutate(`Drop 1` = Mode %in% df_0120$mode) %>%
+               mutate(`Drop 2` = Mode %in% df_0220$mode) )
+```
+
+## URLs
+A total of `r length(unique(df$url))` URLs were measured between the two drops, with `r length(unique(df_0120$url))` being measured in the first, and `r length(unique(df_0220$url))` in the second. 
+
+
+```{r urls, echo=FALSE}
+knitr::kable(
+  data.frame(URL = sort(unique(df$url))) %>%
+    mutate(`Drop 1` = URL %in% df_0120$url) %>%
+    mutate(`Drop 2` = URL %in% df_0220$url) 
+    )
+```
+
+## Visual Metrics
+
+```{r vis_metrics, echo=FALSE}
+knitr::kable(df_status(df %>% select(visual_metrics), print_results=FALSE))
+```
+
+## Navigation and Resource Metrics
+
+The [navigation](https://docs.google.com/document/d/1W-EREsJLuRvTPvGXaW71FvuAGXkoLNDZmZl-sbaeMZM/edit#heading=h.q9b66ketjl7j) and resource metrics can be categorized as follows:
+
+Features that represent page load completion:
+
+* `loadtime`
+* `rumSpeedIndex`
+* `domInteractive`
+* `DOMContentLoaded`
+* `firstPaint`
+
+Feature representing starting point of backend activity:
+
+* `connectStart`
+* `domainLookupStart`
+* `domainLookupEnd`
+* `fetchStart`
+* `requestStart`
+* `responseStart`
+* `responseEnd`
+
+Features representing total duration of certain portions of backend activity:
+
+* `backendTime`
+* `domainLookupTime`
+* `frontEndTime`
+* `redirectionTime`
+* `resourceDuration`
+* `serverConnectionTime`
+* `serverResponseTime`
+
+Features representing resource usage:
+
+* `decodedBodySize`
+* `encodedBodySize`
+* `resourceCount`
+
+```{r nav_timing_grps, echo=FALSE}
+pl_covars <- c('loadtime', 'rumSpeedIndex', 'domInteractive', 'DOMContentLoaded', 'firstPaint')
+bckend_covars <- c('connectStart', 'domainLookupStart', 'domainLookupEnd', 'fetchStart', 
+                   'requestStart', 'responseStart', 'responseEnd')
+dur_covars <- c('backendTime', 'frontEndTime', 'resourceDuration', 'serverResponseTime')
+res_covars <- c('decodedBodySize', 'encodedBodySize','resourceCount')
+```
+
+```{r filtered_nav_timing, echo=FALSE}
+df_state <- df_status(df %>% select(nav_timings), print_results=FALSE)
+
+dropped_covars <- df_state %>%
+  filter(q_zeros > 0) %>%
+  pull(variable)
+
+nav_timing_clean <- nav_timings[!nav_timings %in% dropped_covars]
+```
+
+`r length(nav_timings)-1` navigation and resource metrics were measured for each drop. `r length(dropped_covars)` had a significant fraction of 0 values, correspoding to no measurement. Interstingly, these all appear to be total times <need better explaination>. These have been filtered from subsequent analysis (`r paste(dropped_covars, sep=', ')`).
+
+```{r args, echo=FALSE}
+knitr::kable(df_state)
+```
+
+# SpeedIndex{.tabset}
+Focus on drop 2, as each mode was measured for each URL (e.g., completeness). 
+
+## Mode
+
+The following plot shows the distribution of speedIndex, in two different views ridge (left) and violin (right) plots. The shading in the ridge plots represent the 0-20th, 20-40th, 40-60th, and 80-100th quartiles. 
+
+The distributions between builds of Fenix are very consistent. `fennec68` has a lower `speedIndex` values for the lower two quartiles. 
+
+```{r speedIndex_d2, fig.width=15, fig.height=8, echo=FALSE, warning=FALSE, message=FALSE}
+response <- 'speedIndex'
+
+df_0220_long_si <- df_0220 %>%
+  select(mode, url, speedIndex, nav_timing_clean) %>%
+  gather('nav_timing', 'nav_timing_value', -speedIndex, -mode, -url)
+
+ps = list()
+ps[['ridge']] <- ggplot(df_0220, aes(x=speedIndex, y=mode, fill = factor(stat(quantile)))) +
+  stat_density_ridges(
+    geom = "density_ridges_gradient", calc_ecdf = TRUE,
+    quantiles = 5, quantile_lines = TRUE
+  ) +
+  scale_fill_viridis_d(name = "Quartiles") +
+  theme(axis.text.y = element_text(angle = 25, hjust = 1)) +
+  xlim(0, 10000)
+
+ps[['violin']] <- ggplot(df_0220, aes(mode, speedIndex)) + 
+  geom_violin(draw_quantiles = c(0.20, 0.4, 0.60, 0.80)) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+plot_grid(plotlist = ps)
+```
+
+## Correlation
+
+```{r corr, echo=FALSE}
+df_corr <- df_0220[, c(nav_timing_clean, 'speedIndex')]
+cor_si <- cor(df_corr)
+
+cor_si_cut <- as.data.frame(cor_si) %>% 
+  tibble::rownames_to_column("nav_timing") %>% 
+  select(nav_timing, speedIndex) %>% 
+  filter(speedIndex > 0.5) %>% 
+  arrange(desc(speedIndex)) %>%
+  slice(-1)
+```
+
+The correlation of these visual metrics across all modes is shown in the following plot. The rightmost column contains `speedIndex`. `r length(cor_si_cut)` timings have correlations > 0.5: `r paste(cor_si_cut$nav_timing, sep=',')`. Interestingly, `rumSpeedIndex` has a low Pearson correlation to `speedIndex`.
+
+Interesting `decodedBodySize`, and `frontEndTime` are correlated to the visual metrics. The first two aren't highly correlated to `loadtime`. This could be useful for modeling, as they might contain information that the other previously used navigation times don't contain. `frontEndTime` is highly correlated to `loadTime`, therefore it might be redundant. 
+
+< need to get droppped covars removed from plot>
+
+```{r corrplot, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+corrplot::corrplot(cor_si, 
+                   method = 'pie',
+                   type = 'upper')# , order = 'hclust', addrect = 3) 
+# corrplot(cor(df %>% select(-c(mode, url))), method = 'pie', type = 'upper') 
+```
+
+Showing the differeing measures
+
+```{r corrplot_hcl, fig.width=10, fig.height=10, echo=FALSE, warning=FALSE}
+df_corr_heir <- df_corr[, c(cor_si_cut$nav_timing, 'speedIndex')]
+corrplot::corrplot(cor(df_corr_heir), 
+                   method = 'pie',
+                   order = 'hclust', addrect = 2) 
+# corrplot(cor(df %>% select(-c(mode, url))), method = 'pie', type = 'upper') 
+```
+
+
+
+## Navigation and Resource Metrics{.tabset}
+
+< clean up plot:
+1. axis limits set
+2. merge y-axis
+
+< correlation plot>
+
+A few of the clear takeaways are:
+
+* Relationship strongly dependent upon `uri`.
+* Relationship has no real dependency on `mode`.
+   - However, `fennec68` 
+* Several of the timings have a strong linear relationship with `speedIndex` (e.g., `rumSpeedIndex`, `loadTime`, `decodedBodySize`)
+  - However, there are consistent outliers across the timings: https://www.nytimes.com, https://www.bing.com/search?q=restaurant 
+* `decodedBodySize` and `encodedBodySize` cannot account simultaneoulsy for the deviation in https://www.nytimes.com, and the large spread in https://www.bing.com/search?q=restaurant, with high values observed for https://accounts.google.com.
+* Significant spread in the relationship to navigation timing for low `speedIndex` values. 
+
+< add in stuff regarding correlations >
+
+### Page Load Timings
+
+The figures below compares `speedIndex` to the page load timings. 
+
+```{r , fig.width=15, fig.height=40, echo=FALSE, warning=FALSE}
+
+# ggplot(df_0220_long %>% 
+#          filter(vis_metric == 'speedIndex'), 
+#        aes(vis_metric_value, nav_timing_value)) +
+#   geom_point(aes(shape=mode, color=url)) + 
+#   facet_grid(vars(nav_timing), scales='free')
+
+# plist <- list()
+# for (i in 1:length(nav_timing_clean)){
+#   nav_timing <- nav_timing_clean[i]
+#   p <- ggplot(df_0220 %>%
+#                 filter(DOMContentLoaded < 10000) %>%
+#                 filter(resourceDuration < 500000),
+#               aes_string(nav_timing, 'speedIndex')) +
+#     geom_point(aes(color = url, shape=mode)) +
+#     geom_smooth(method = "lm", se = FALSE) +
+#     theme_bw()
+#   if(i==22){
+#     # plist[['legend']] <- get_legend(p + theme(legend.position = "top"))
+#     plist[['legend']] <- get_legend(p + theme(legend.position = "right"))
+#   }
+#   p <- p + theme(legend.position = "none")
+#   plist[[nav_timing]] <- p
+# }
+# 
+# plot_grid(plotlist = plist, ncol=3)
+
+# plist <- list()
+# covar_grps <- split(nav_timing_clean, ceiling(seq_along(nav_timing_clean)/3))
+# for (i in 1:length(covar_grps)){
+#   grp <- covar_grps[i][[1]]
+#   df_covar_grp <- df_0220_long %>%
+#     filter(nav_timing %in% grp) %>%
+#     filter(vis_metric == 'speedIndex')
+#   p <- ggplot(df_covar_grp, aes(nav_timing_value, vis_metric_value)) +
+#     geom_point(aes(color = url, shape=mode)) +
+#     geom_smooth(method = "lm", se = FALSE) +
+#     facet_grid(cols=vars(nav_timing), scales = 'free') +
+#     theme_bw()
+#   if(i==22){
+#     # plist[['legend']] <- get_legend(p + theme(legend.position = "top"))
+#     plist[['legend']] <- get_legend(p + theme(legend.position = "right"))
+#   }
+#   p <- p + theme(legend.position = "none")
+#   plist[[i]] <- p
+# }
+# 
+# plot_grid(plotlist = plist, ncol=1)
+```
+
+```{r page_load_si_plts, fig.width=10, fig.height=5, echo=FALSE, warning=FALSE}
+# out.width='100%', out.height='100%', echo=FALSE, warning=FALSE}
+ggplotly(ggplot(df_0220_long_si %>%
+             filter(nav_timing %in% pl_covars), aes(nav_timing_value, speedIndex)) +
+  geom_point(aes(color = url, shape=mode)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(cols=vars(nav_timing), scales = 'free') +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(color = guide_legend(nrow=5, byrow=TRUE), shape = guide_legend(nrow=4, byrow=TRUE)) +
+  xlab('') +
+  ylab('SpeedIndex'))  #%>%
+  #layout(autosize = F, autosize = F, width = 800, height = 500)
+```
+
+### Backend Timings
+
+The figures below compares `speedIndex` to the page load timings. 
+
+```{r backend_timing_si_plts, fig.width=10, fig.height=5, echo=FALSE, warning=FALSE}
+ggplotly(ggplot(df_0220_long_si %>%
+             filter(nav_timing %in% bckend_covars), aes(nav_timing_value, speedIndex)) +
+  geom_point(aes(color = url, shape=mode)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(cols=vars(nav_timing), scales = 'free') +
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(color = guide_legend(nrow=5, byrow=TRUE), shape = guide_legend(nrow=4, byrow=TRUE)) +
+  xlab('') + 
+  ylab('SpeedIndex')) #%>%
+  #layout(autosize = F, autosize = F, width = 800, height = 500)
+```
+
+### Backend Durations
+
+The figures below compares `speedIndex` to the page load timings. 
+
+```{r backend_dur_si_plts, fig.width=10, fig.height=5, echo=FALSE, warning=FALSE}
+ggplotly(ggplot(df_0220_long_si %>%
+             filter(nav_timing %in% dur_covars), aes(nav_timing_value, speedIndex)) +
+  geom_point(aes(color = url, shape=mode)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(cols=vars(nav_timing), scales = 'free') +
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(color = guide_legend(nrow=5, byrow=TRUE), shape = guide_legend(nrow=4, byrow=TRUE)) +
+  xlab('') + 
+  ylab('SpeedIndex')) # %>%
+  #layout(autosize = F, autosize = F, width = 800, height = 500)
+```
+
+### Resource Usage
+
+The figures below compares `speedIndex` to resource usage. 
+
+```{r resource_si_plts, fig.width=10, fig.height=5, echo=FALSE, warning=FALSE}
+ggplotly(ggplot(df_0220_long_si %>%
+             filter(nav_timing %in% res_covars), aes(nav_timing_value, speedIndex)) +
+  geom_point(aes(color = url, shape=mode)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(cols=vars(nav_timing), scales = 'free') +
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  guides(color = guide_legend(nrow=5, byrow=TRUE), shape = guide_legend(nrow=4, byrow=TRUE)) +
+  xlab('') + 
+  ylab('SpeedIndex')) # %>%
+  # layout(autosize = F, autosize = F, width = 800, height = 500)
+```
+
+# Feature Generation
+Features were generated using [page load cycle](https://docs.google.com/document/d/1W-EREsJLuRvTPvGXaW71FvuAGXkoLNDZmZl-sbaeMZM/edit#heading=h.q9b66ketjl7j) definitions, and referring to efforts of this [bug](https://bugzilla.mozilla.org/show_bug.cgi?id=1615369). See 
+
+## Feature Filtering
+Keep the search space tractable:
+
+* Drop `responseStart` and `responseEnd` as  `backendTime` as perfectly correlated
+* Drop `connectStart`, `domainLookupEnd`, `domainLookupStart`, `fetchStart` as perfectly correlated to `redirectionTime`
+* `loadtime` and `rumSpeedIndex` stay, but `domInteractive`, `DOMContentLoaded`, `firstPaint` censored.
+   - Feature selection (Boruta<link> and Mars<link>) run on original dataset put these two to top.
+   - visual inspection gives greatest differentiation
+   - `loadtime` correlates strongest with `speedIndex`
+   - `rumSpeedIndex` as we are researching it. visually looks good
+* Drop `decodedBodySize` as very similar to `encodedBodySize`. Though differs by these URLs <note these in EDA above>
+   - `rumSpeedIndex` and `loadtime` have least correlation between page load metrics
+
+# Feature Creation
+
+* ratio of `decodedBodySize` to `encodedBodySize`
+* ratio of `encodedBodySize` to `resourceCount` 
+* ratio of page load to `resourceCount` and `encodedBodySize`: <maybe the full timing???>
+* difference of `responseStart`, `requestStart` to `loadtime`, `rumSpeedIndex`
+* `resourceCount`, `encodedBodySize` with page load timings
+* ratio of `loadtime`, `rumSpeedIndex` to durations
+* ratio of durations to `encodedBodySize`
+  - `encodedBodySize` not highly correlated to any durations
+
+```{r feature_generation, echo=FALSE}
+
+df_0220_ultra <- df_0220 %>% 
+  # ratio of de to encodedBodySize
+  mutate(ratioDeEnCoded = decodedBodySize/encodedBodySize) %>%
+  # ratio of page load to encodedBodySize
+  mutate(rsi_encodedBodySize = rumSpeedIndex/encodedBodySize) %>% 
+  mutate(rsi_resourceCount = rumSpeedIndex/resourceCount) %>%
+  mutate(lt_encodedBodySize = loadtime/encodedBodySize) %>% 
+  mutate(lt_resourceCount = loadtime/resourceCount) %>%
+  # difference of responseStart
+  mutate(rsi_responseStart = rumSpeedIndex-responseStart) %>% 
+  mutate(rsi_requestStart = rumSpeedIndex-requestStart) %>%
+  mutate(lt_responseStart = loadtime-responseStart) %>% 
+  mutate(lt_requestStart = loadtime-requestStart) %>%
+  # ratio of page load to durations 
+  mutate(rsi_backendTime = rumSpeedIndex/backendTime) %>% 
+  mutate(rsi_frontEndTime = rumSpeedIndex/frontEndTime) %>% 
+  mutate(rsi_resourceDuration = rumSpeedIndex/resourceDuration) %>%
+  mutate(rsi_serverResponseTime = rumSpeedIndex/serverResponseTime) %>%
+  mutate(lt_backendTime = loadtime/backendTime) %>% 
+  mutate(lt_frontEndTime = loadtime/frontEndTime) %>% 
+  mutate(lt_resourceDuration = loadtime/resourceDuration) %>%
+  mutate(lt_serverResponseTime = loadtime/serverResponseTime) %>%
+  # ratio of durations to encodedBodySize
+  mutate(bet_encodedBodySize = backendTime/encodedBodySize) %>% 
+  mutate(fet_encodedBodySize = frontEndTime/encodedBodySize) %>%
+  mutate(rd_encodedBodySize = resourceDuration/encodedBodySize) %>%
+  mutate(srt_encodedBodySize = serverResponseTime/encodedBodySize) 
+```
+
+```{r feature_filtering, echo=FALSE}
+df_0220_ultra_f <- df_0220_ultra %>%
+  select(-c(responseStart, responseEnd, connectStart, domainLookupStart, domainLookupEnd, fetchStart,
+         domInteractive, DOMContentLoaded, firstPaint, 
+         decodedBodySize,
+         visualComplete85, firstVisualChange, contentfulSpeedIndex, perceptualSpeedIndex)) 
+```
+
+
+# Variable Importance{.tabset}
+
+In order to fit a regression, we apply feature selection on the complete covariate set
+There are various methods for determining variable importance. Two explored here are Boruta and using the Mars library.
+
+<Explain resultant feature defs>
+
+## Boruta
+[Boruta](https://cran.r-project.org/web/packages/Boruta/index.html) is a feature selection algorithm that trains suites of Random Forest models to determine variable importance for regression and classification tasks. 
+
+The following table shows the variable importance measures found for each navigation timing. Unlike the Pearson correlation, `rumSpeedIndex` and `encodedBodySize` are found to have high importance, while `DomContentLoaded` has relative low importance. Again, `decodedBodySize`, `loadTime`, `frontEndTime` and `resourceCount` are all found to have the highest importance.  
+
+```{r boruta, echo=FALSE, warning=FALSE, message=FALSE}
+speedIndex.bor <- Boruta(speedIndex ~ ., data = df_0220_ultra_f %>% 
+                           select(-c(mode, url)),
+                         doTrace = TRUE, ntree = 500, maxRuns = 1000)
+
+speedIndex.bor.df <- attStats(speedIndex.bor) %>% 
+  tibble::rownames_to_column(., 'covariate') %>% 
+  arrange(desc(medianImp)) %>%
+  select(covariate, meanImp, medianImp)
+
+knitr::kable(speedIndex.bor.df)
+```
+
+## Mars
+
+[MARS](https://en.wikipedia.org/wiki/Multivariate_adaptive_regression_spline) "is an automatic regression technique which can be seen as a generaliza-tion of multiple linear regression and generalized linear model.  In the MARS algorithm,the  contribution  (or  variable  importance  score)  for  each  predictor  is  determined  using  ageneralized cross-validation (GCV) statistic."
+"
+```{r mars, echo=FALSE, warning=FALSE, message=FALSE}
+library(earth)
+speedIndex.mars <- earth(speedIndex ~ ., data = df_0220_ultra_f %>% 
+                           select(-c(mode, url)))
+ev <- evimp (speedIndex.mars)
+knitr::kable(as.data.frame(unclass(ev[,c(3,4,6)])))
+# plot(ev)
+```
+
+# Model Fitting{.tabset}
+## Leave-one-out CV{.tabset}
+### Mars Features
+
+<calculate RMSE for the LOO>
+
+* modes appear to follow general trend fo URLs, but fennec can be offset
+ - NYTimes, 
+* Fit is in general okay
+* NY Times has has missing information: clusterc
+
+```{r lm_loo, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
+cv_lm_loo <- function(df, formula, response){
+  cv <- NULL
+  for (i in 1:length(urls)){
+    # train/test samples
+    train_urls <- urls[-i]
+    train <- df %>% 
+      filter(url %in% train_urls) 
+    test <- df %>% 
+      filter(!url %in% train_urls)
+    # fit model
+    lm_cv <- lm(formula = formula, data = train) 
+    cv <- rbind(cv, data.frame(response = test[[response]],
+                             prediction = predict(lm_cv, test),
+                             fold = i,
+                             url = test$url,
+                             mode = test$mode))
+  }
+  # cv <- cv %>%
+  #   mutate(residual = (prediction-response)/response)
+  return(cv)
+}
+
+cv <- cv_lm_loo(df_0220_ultra_f, 
+                      formula = speedIndex ~ rumSpeedIndex + ratioDeEnCoded + lt_encodedBodySize + lt_backendTime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -mode, -fold)
+
+ggplotly(ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url, shape=mode)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  # facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  theme(legend.position = "none")+
+        # axis.text.x = element_text(angle = 90, hjust = 1)) +
+  #guides(color = guide_legend(ncol=2, byrow=TRUE), shape = guide_legend(nrow=4, byrow=TRUE)) +
+  xlab(response) +
+  ylab('Predicitons')
+  )
+```
+
+## Boruta Features
+Interestingly, Boruta's fits are significantly worse. Something to definintely note!
+```{r lm_loo_boruta, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
+cv <- cv_lm_loo(df_0220_ultra_f, 
+                      formula = speedIndex ~ rumSpeedIndex + rsi_requestStart + srt_encodedBodySize + loadtime + rsi_responseStart,
+                      response) %>%
+    gather('metric', 'value', -response, -url, -mode, -fold)
+
+ggplotly(ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url, shape=mode)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  # facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  theme(legend.position = "none")+
+        # axis.text.x = element_text(angle = 90, hjust = 1)) +
+  #guides(color = guide_legend(ncol=2, byrow=TRUE), shape = guide_legend(nrow=4, byrow=TRUE)) +
+  xlab(response) +
+  ylab('Predicitons')
+  )
+```
+
+
+# Model Validation{.tabset}
+<Calculate MSE of final model, R2, etc...> 
+
+- No device dependency again
+- Fit is okay
+
+## Model Fit
+
+Fit model without `rumSpeedIndex` 
+
+The results of the MARS algorithm:
+```{r mars_val, echo=FALSE, warning=FALSE, error=FALSE}
+library(earth)
+speedIndex.mars.val <- earth(speedIndex ~ ., data = df_0220_ultra_f %>% 
+                           select(-c(mode, url, rumSpeedIndex, starts_with('rsi'))))
+ev.val <- evimp (speedIndex.mars.val)
+knitr::kable(as.data.frame(unclass(ev.val[,c(3,4,6)])))
+```
+
+And the results of the LOO CV:
+
+These appear very similar to those including `rumSpeedIndex`. 
+```{r, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
+cv <- cv_lm_loo(df_0220_ultra_f, 
+                      formula = speedIndex ~ loadtime + ratioDeEnCoded + lt_encodedBodySize + resourceCount,
+                      response) %>%
+    gather('metric', 'value', -response, -url, -mode, -fold)
+
+ggplotly(ggplot(cv, aes(response, value))+
+  geom_point(aes(color = url, shape=mode)) +
+  geom_abline(slope = 1) + 
+  geom_abline(slope = 0) + 
+  # facet_grid(rows = vars(metric), scales = 'free_y') +
+  theme_bw() + 
+  theme(legend.position = "none")+
+        # axis.text.x = element_text(angle = 90, hjust = 1)) +
+  #guides(color = guide_legend(ncol=2, byrow=TRUE), shape = guide_legend(nrow=4, byrow=TRUE)) +
+  xlab(response) +
+  ylab('Predicitons')
+  )
+```
+
+## Validation
+```{r lm_val_model_fit, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
+lm.val <- lm(speedIndex ~ loadtime + ratioDeEnCoded + lt_encodedBodySize + resourceCount, data = df_0220_ultra_f)
+
+df.val <- df_0120 %>%
+  # ratio of de to encodedBodySize
+  mutate(ratioDeEnCoded = decodedBodySize/encodedBodySize) %>%
+  # ratio of page load to encodedBodySize
+  mutate(lt_encodedBodySize = loadtime/encodedBodySize) %>% 
+  mutate(lt_resourceCount = loadtime/resourceCount) %>%
+  # difference of responseStart
+  mutate(lt_responseStart = loadtime-responseStart) %>% 
+  mutate(lt_requestStart = loadtime-requestStart) %>%
+  # ratio of page load to durations 
+  mutate(lt_backendTime = loadtime/backendTime) %>% 
+  mutate(lt_frontEndTime = loadtime/frontEndTime) %>% 
+  mutate(lt_resourceDuration = loadtime/resourceDuration) %>%
+  mutate(lt_serverResponseTime = loadtime/serverResponseTime) %>%
+  # ratio of durations to encodedBodySize
+  mutate(bet_encodedBodySize = backendTime/encodedBodySize) %>% 
+  mutate(fet_encodedBodySize = frontEndTime/encodedBodySize) %>%
+  mutate(rd_encodedBodySize = resourceDuration/encodedBodySize) %>%
+  mutate(srt_encodedBodySize = serverResponseTime/encodedBodySize) %>%
+  mutate(predictions = predict(lm.val, .))
+
+ggplotly(
+    ggplot(df.val, aes(speedIndex, predictions))+
+    geom_point(aes(color = url, shape=mode)) +
+    geom_abline(slope = 1) + 
+    geom_abline(slope = 0) + 
+    # facet_grid(rows = vars(metric), scales = 'free_y') +
+    theme_bw() + 
+    theme(legend.position = "none") +
+    xlab(response)
+)
+```
+
+Results look pretty much like the fits above. Again mode isn't that big of a deal it appears. Much more URL dependent!. 
+
+# Next Steps
+
+1. Acquire significantly more live sites
+2. Utilize RFE, with resampling across URLs to determine optimal feature set.
+3. Examine additional regression modeling techinques.
+4. Weighted regression to deal with URL splitting. Very little data in middel. 
+3. Additional metrics to determine differences observed
+   - specific URLs
