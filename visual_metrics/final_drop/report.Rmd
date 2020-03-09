@@ -25,17 +25,9 @@ library(plotly)
 library(MLmetrics)
 ```
 
-# tl;dr
-This analysis is an extension of the [previous](https://metrics.mozilla.com/protected/cdowhygelund/visual_metrics_nav_timings.html), with the inclusion of additional covariates for modeling the visual metrics, specifically resource and network metrics. Its focus is to determine an optimal linear regression model that predicts `speedIndex` using the navigation and resource metrics. It is found the relationship between the visual and metrics has a strong dependency on URL, but a weak on mode (e.g., application). The resultant model performance is < > from the training set, and < > using a hold-out validation set. 
-
-This work establishes the method of producing a production model. To obtain a production model in practice, it is recommended that significantly more URLs are measured across a range of applications and platforms. 
-
-# Datasets{.tabset}
-
-Two datasets were provided in early 2020 by Andrew Creskey that contain in-house, live-site testing of a range of URLs for various mobile Firefox versions (`mode`) . Hereafter they referred to as drop 1 and 2. The datasets have identical measurements, save the inclusion of `rumSpeedIndex` in the drop 2. However, they differ on the mobile application version, and URLs tested.
-
-
 ```{r data_import, echo=FALSE, warning=FALSE}
+response <- 'speedIndex'
+
 load('livesites_withNetworkMetrics.RData')
 df_0120 <- df 
 
@@ -69,12 +61,145 @@ df_0220_long <- df_0220 %>%
 urls <- unique(df_0220$url)
 ```
 
+```{r nav_timing_grps, echo=FALSE}
+pl_covars <- c('loadtime', 'rumSpeedIndex', 'domInteractive', 'DOMContentLoaded', 'firstPaint')
+bckend_covars <- c('connectStart', 'domainLookupStart', 'domainLookupEnd', 'fetchStart', 
+                   'requestStart', 'responseStart', 'responseEnd')
+dur_covars <- c('backendTime', 'frontEndTime', 'resourceDuration', 'serverResponseTime')
+res_covars <- c('decodedBodySize', 'encodedBodySize','resourceCount')
+```
+
+```{r filtered_nav_timing, echo=FALSE}
+df_state <- df_status(df %>% select(nav_timings), print_results=FALSE)
+
+dropped_covars <- df_state %>%
+  filter(q_zeros > 0) %>%
+  pull(variable)
+
+nav_timing_clean <- nav_timings[!nav_timings %in% dropped_covars]
+```
+
+```{r feature_generation, echo=FALSE}
+
+df_0220_ultra <- df_0220 %>% 
+  # ratio of de to encodedBodySize
+  mutate(ratioDeEnCoded = decodedBodySize/encodedBodySize) %>%
+  # ratio of resourceCount to encodedBodySize
+  mutate(ratioRescountEncoded = resourceCount/encodedBodySize) %>%
+  # ratio of page load to encodedBodySize
+  mutate(rsi_encodedBodySize = rumSpeedIndex/encodedBodySize) %>% 
+  mutate(rsi_resourceCount = rumSpeedIndex/resourceCount) %>%
+  mutate(lt_encodedBodySize = loadtime/encodedBodySize) %>% 
+  mutate(lt_resourceCount = loadtime/resourceCount) %>%
+  # difference of responseStart
+  mutate(rsi_responseStart = rumSpeedIndex-responseStart) %>% 
+  mutate(rsi_requestStart = rumSpeedIndex-requestStart) %>%
+  mutate(lt_responseStart = loadtime-responseStart) %>% 
+  mutate(lt_requestStart = loadtime-requestStart) %>%
+  # ratio of page load to durations 
+  mutate(rsi_backendTime = rumSpeedIndex/backendTime) %>% 
+  mutate(rsi_frontEndTime = rumSpeedIndex/frontEndTime) %>% 
+  mutate(rsi_resourceDuration = rumSpeedIndex/resourceDuration) %>%
+  mutate(rsi_serverResponseTime = rumSpeedIndex/serverResponseTime) %>%
+  mutate(lt_backendTime = loadtime/backendTime) %>% 
+  mutate(lt_frontEndTime = loadtime/frontEndTime) %>% 
+  mutate(lt_resourceDuration = loadtime/resourceDuration) %>%
+  mutate(lt_serverResponseTime = loadtime/serverResponseTime) %>%
+  # ratio of durations to encodedBodySize
+  mutate(bet_encodedBodySize = backendTime/encodedBodySize) %>% 
+  mutate(fet_encodedBodySize = frontEndTime/encodedBodySize) %>%
+  mutate(rd_encodedBodySize = resourceDuration/encodedBodySize) %>%
+  mutate(srt_encodedBodySize = serverResponseTime/encodedBodySize) 
+```
+
+```{r feature_filtering, echo=FALSE}
+df_0220_ultra_vis <- df_0220_ultra %>%
+  select(-c(responseStart, responseEnd, connectStart, domainLookupStart, domainLookupEnd, fetchStart,
+         domInteractive, DOMContentLoaded, firstPaint, 
+         decodedBodySize))
+
+df_0220_ultra_f <- df_0220_ultra_vis %>%
+  select(-c(visualComplete85, firstVisualChange, contentfulSpeedIndex, perceptualSpeedIndex)) 
+         
+```
+
+```{r mars, echo=FALSE, warning=FALSE, message=FALSE}
+library(earth)
+speedIndex.mars <- earth(speedIndex ~ ., data = df_0220_ultra_f %>% 
+                           select(-c(mode, url)))
+ev <- evimp (speedIndex.mars)
+# plot(ev)
+```
+
+```{r lm_loo, echo=FALSE, warning=FALSE}
+cv_lm_loo <- function(df, formula, response){
+  cv <- NULL
+  for (i in 1:length(urls)){
+    # train/test samples
+    train_urls <- urls[-i]
+    train <- df %>% 
+      filter(url %in% train_urls) 
+    test <- df %>% 
+      filter(!url %in% train_urls)
+    # fit model
+    lm_cv <- lm(formula = formula, data = train) 
+    cv <- rbind(cv, data.frame(response = test[[response]],
+                             prediction = predict(lm_cv, test),
+                             fold = i,
+                             url = test$url,
+                             mode = test$mode))
+  }
+  # cv <- cv %>%
+  #   mutate(residual = (prediction-response)/response)
+  return(cv)
+}
+
+cv <- cv_lm_loo(df_0220_ultra_f, 
+                      formula = speedIndex ~ rumSpeedIndex + ratioDeEnCoded + lt_encodedBodySize + lt_backendTime,
+                      response) %>%
+  gather('metric', 'value', -response, -url, -mode, -fold)
+
+```
+
+```{r lm_val_model_fit, echo=FALSE, warning=FALSE}
+lm.val <- lm(speedIndex ~ loadtime + ratioDeEnCoded + lt_encodedBodySize + resourceCount, data = df_0220_ultra_f)
+
+df.val <- df_0120 %>%
+  # ratio of de to encodedBodySize
+  mutate(ratioDeEnCoded = decodedBodySize/encodedBodySize) %>%
+  # ratio of page load to encodedBodySize
+  mutate(lt_encodedBodySize = loadtime/encodedBodySize) %>% 
+  mutate(lt_resourceCount = loadtime/resourceCount) %>%
+  # difference of responseStart
+  mutate(lt_responseStart = loadtime-responseStart) %>% 
+  mutate(lt_requestStart = loadtime-requestStart) %>%
+  # ratio of page load to durations 
+  mutate(lt_backendTime = loadtime/backendTime) %>% 
+  mutate(lt_frontEndTime = loadtime/frontEndTime) %>% 
+  mutate(lt_resourceDuration = loadtime/resourceDuration) %>%
+  mutate(lt_serverResponseTime = loadtime/serverResponseTime) %>%
+  # ratio of durations to encodedBodySize
+  mutate(bet_encodedBodySize = backendTime/encodedBodySize) %>% 
+  mutate(fet_encodedBodySize = frontEndTime/encodedBodySize) %>%
+  mutate(rd_encodedBodySize = resourceDuration/encodedBodySize) %>%
+  mutate(srt_encodedBodySize = serverResponseTime/encodedBodySize) %>%
+  mutate(predictions = predict(lm.val, .))
+```
+
+
+# tl;dr
+This works focused on determining an optimal linear regression model that predicts [`speedIndex`](https://sites.google.com/a/webpagetest.org/docs/using-webpagetest/metrics/speed-index) using a combination [navigation](https://docs.google.com/document/d/1W-EREsJLuRvTPvGXaW71FvuAGXkoLNDZmZl-sbaeMZM/edit#heading=h.q9b66ketjl7j) and resource metrics. This analysis is an extension of a [previous](https://metrics.mozilla.com/protected/cdowhygelund/visual_metrics_nav_timings.html) work, which includes additional covariates for modeling the [visual metrics](https://github.com/WPO-Foundation/visualmetrics). These specifically include resource and network metrics, such as `encodedBodySize` and `resourceCount`. It was found the relationship between visual and the other metrics have a strong dependency on URL, but a weak one on mode (e.g., application). The resultant model had a training leave-one-out cross-validation MAPE score of `r round(MAPE(cv$value, cv$response), 2)` and a score of `r round(MAPE(df.val$predictions, df.val$speedIndex), 2)` against a held-out validation set. This proof-of-concept work verifies the ability of producing a useful model that infers visual metrics method from navigation and resource metrics. To obtain a production model, it is recommended that significantly more URLs (100/1000x) are measured across a range of applications and platforms. 
+  
+# Datasets{.tabset}
+
+Two datasets were provided in early 2020 by Andrew Creskey that contain in-house, live-site testing of a range of URLs for various mobile Firefox versions (`mode`) . Hereafter they referred to as drop 1 and 2. The datasets have identical measurements, save the inclusion of [`rumSpeedIndex`](https://github.com/WPO-Foundation/RUM-SpeedIndex) in drop 2, which is an effort to use resource timings as a proxy for `speedIndex`. In addition, the datasets differ in the mobile application versions, and URLs tested.
+
 The same number of measurements with respect to URL and `mode` were taken relative to each dataset:
 
 * Drop 1: `r df_0120 %>% count(mode, url) %>% pull(n) %>% max()` per URL and mode
 * Drop 2: `r df_0220 %>% count(mode, url) %>% pull(n) %>% max()` per URL and mode
 
-## Mode
+## Mode{#mode}
 
 The `mode` field represents the Fenix, Fennec, or GeckoView version tested. 
 
@@ -84,7 +209,7 @@ knitr::kable(data.frame(Mode = sort(unique(df$mode))) %>%
                mutate(`Drop 2` = Mode %in% df_0220$mode) )
 ```
 
-## URLs
+## URLs{#url}
 A total of `r length(unique(df$url))` URLs were measured between the two drops, with `r length(unique(df_0120$url))` being measured in the first, and `r length(unique(df_0220$url))` in the second. 
 
 
@@ -97,7 +222,7 @@ knitr::kable(
 ```
 
 ## Visual Metrics
-`r length(visual_metrics) were measured.
+`r length(visual_metrics)` were measured.
 
 ```{r vis_metrics, echo=FALSE}
 knitr::kable(df_status(df %>% select(visual_metrics), print_results=FALSE))
@@ -141,48 +266,30 @@ Features representing resource usage:
 * `encodedBodySize`
 * `resourceCount`
 
-```{r nav_timing_grps, echo=FALSE}
-pl_covars <- c('loadtime', 'rumSpeedIndex', 'domInteractive', 'DOMContentLoaded', 'firstPaint')
-bckend_covars <- c('connectStart', 'domainLookupStart', 'domainLookupEnd', 'fetchStart', 
-                   'requestStart', 'responseStart', 'responseEnd')
-dur_covars <- c('backendTime', 'frontEndTime', 'resourceDuration', 'serverResponseTime')
-res_covars <- c('decodedBodySize', 'encodedBodySize','resourceCount')
-```
-
-```{r filtered_nav_timing, echo=FALSE}
-df_state <- df_status(df %>% select(nav_timings), print_results=FALSE)
-
-dropped_covars <- df_state %>%
-  filter(q_zeros > 0) %>%
-  pull(variable)
-
-nav_timing_clean <- nav_timings[!nav_timings %in% dropped_covars]
-```
-
-`r length(nav_timings)-1` navigation and resource metrics were measured for each drop. `r length(dropped_covars)` had a significant fraction of 0 values, correspoding to no measurement. Interstingly, these all appear to be total times <need better explaination>. These have been filtered from subsequent analysis (`r paste(dropped_covars, sep=', ')`).
+`r length(nav_timings)-1` navigation and resource metrics were measured for each drop. `r length(dropped_covars)` had a significant fraction of zero values, corresponding to empty measurements. Interestingly, these all involve measurements of certiain periods of  backend activity. These have been filtered from subsequent analysis (`r paste(dropped_covars, sep=', ')`).
 
 ```{r args, echo=FALSE}
 knitr::kable(df_state)
 ```
 
 # SpeedIndex{.tabset}
-Focus on drop 2, as each mode was measured for each URL (e.g., completeness). 
+This effort focused on modeling `speedIndex`, as it is one of the oldest and popular visual metrics. Moreover, `rumSpeedIndex` is a corresponding effort at modeling this metric. 
+
+The drop 2 dataset was only used for the modeling tasks. This ensured completeness in the dataset, such that as each mode was measured similarly for each URL. The drop 1 dataset is used as a [hold-out](https://en.wikipedia.org/wiki/Training,_validation,_and_test_sets#Holdout_dataset) validation set. 
 
 ## Mode
 
-The following plot shows the distribution of speedIndex, in two different views ridge (left) and violin (right) plots. The shading in the ridge plots represent the 0-20th, 20-40th, 40-60th, and 80-100th quintiles 
+The following plot shows the distribution of speedIndex, as a ridge plot. The shading in the ridge plots represent the 0-20th, 20-40th, 40-60th, and 80-100th quintiles 
 
 The distributions between builds of Fenix are very consistent. `fennec68` has a lower values for the lower two quintiles, and higher for the 5th. 
 
 ```{r speedIndex_d2, fig.width=8, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE}
-response <- 'speedIndex'
-
 df_0220_long_si <- df_0220 %>%
   select(mode, url, speedIndex, nav_timing_clean) %>%
   gather('nav_timing', 'nav_timing_value', -speedIndex, -mode, -url)
 
 # ps = list()
-# ps[['ridge']] <- 
+#ps[['ridge']] <- 
 ggplot(df_0220, aes(x=speedIndex, y=mode, fill = factor(stat(quantile)))) +
   stat_density_ridges(
     geom = "density_ridges_gradient", calc_ecdf = TRUE,
@@ -192,14 +299,14 @@ ggplot(df_0220, aes(x=speedIndex, y=mode, fill = factor(stat(quantile)))) +
   theme(axis.text.y = element_text(angle = 25, hjust = 1)) +
   xlim(0, 10000)
 
-# ps[['violin']] <- ggplot(df_0220, aes(mode, speedIndex)) + 
+# ps[['violin']] <- ggplot(df_0220, aes(mode, speedIndex)) +
 #   geom_violin(draw_quantiles = c(0.20, 0.4, 0.60, 0.80)) +
 #   theme(axis.text.x = element_text(angle = 20, hjust = 1))
 # 
 # plot_grid(plotlist = ps)
 ```
 
-## Correlation {#corr}
+## Correlation{#corr}
 
 ```{r corr, echo=FALSE}
 df_corr <- df_0220[, c(nav_timing_clean, 'speedIndex')]
@@ -233,15 +340,14 @@ corrplot::corrplot(cor_si,
 ```
 
 ## Navigation and Resource Metrics{.tabset}
-{#nav}
-The following interactive plots display `speedIndex` versus the navigation and resource metrics. The color represents URL, and shape represents mode. There are a few clear takeaways:
+The following interactive plots display `speedIndex` versus the navigation and resource metrics. A points color represents [URL](#url), and shape represents [mode](#mode). There are a few clear takeaways:
 
 * Relationships are strongly dependent upon `uri`.
 * Relationships have much less dependency on `mode`.
    - However, `fennec68` does have cases were it is offset with respect to `fenix<>` measurements. 
-* Several of the metris, especially the page load timings, have a strong linear relationship with `speedIndex` (e.g., `rumSpeedIndex`, `loadTime`, `encodedBodySize`),
-  - However, there are consistent outliers across the metrics (e.g.: https://www.nytimes.com, https://www.bing.com/search?q=restaurant).
-* `decodedBodySize` and `encodedBodySize` cannot account simultaneoulsy for the deviation in https://www.nytimes.com, and the large spread in https://www.bing.com/search?q=restaurant, with high values observed for https://accounts.google.com.
+* Several of the metrics, especially the page load timings, have a strong linear relationship with `speedIndex` (e.g., `rumSpeedIndex`, `loadTime`, `encodedBodySize`),
+  - There are consistent outliers across the metrics (e.g.: https://www.nytimes.com, https://www.bing.com/search?q=restaurant).
+* `decodedBodySize` and `encodedBodySize` cannot account simultaneously for the deviation in https://www.nytimes.com, and the large spread in https://www.bing.com/search?q=restaurant, with high values observed for https://accounts.google.com.
 * Significant spread in the relationship to navigation and resource metrics for low `speedIndex` values. 
 
 ### Page Load Timings
@@ -376,27 +482,26 @@ ggplotly(ggplot(df_0220_long_si %>%
 The modeling effort focused on best representing `speedIndex` using the navigation and resource metrics for the 2nd dataset drop containing `rumSpeedIndex`. The steps taken are as follows: 
 
 1. Review correlations between fields and `speedIndex`.
-2  Generate new features that could be informative. 
-3. Drop uninformative and unimportant features.
-4. Perform feature selection to narrow covariate space. Keep top four features. 
-5. Perform leave-one-out cross validation with respect to unique URI. Simple linear models are trained. 
-6. Validate model performance against the first drop dataset. 
+2. Generate new, potentially informative, features from the original covariates. 
+3. Filter out uninformative and unimportant features.
+4. Perform algorithmic feature selection to further narrow covariate space. Keep top _N_ features. 
+5. Perform leave-one-out cross validation with respect to unique URIs. Train simple linear regression models. 
+6. Validate model performance against the drop 1 dataset. 
 
 ## Feature Filtering
-Redundant and uninformative features were filtered, in order to increase model performance, and to keep the feature selection search space tractable. The following filtering steps were performed:
+Redundant and uninformative features were manually filtered, in order to increase model performance, and to keep the feature selection search space tractable. The following filtering steps were performed:
 
 * `responseStart` and `responseEnd` were dropped as they are perfectly correlated to `backendTime`.
 * `connectStart`, `domainLookupEnd`, `domainLookupStart`, `fetchStart` were dropped as they are perfectly correlated to `redirectionTime`.
 * The page load timings `domInteractive`, `DOMContentLoaded`, `firstPaint` were filtered:
     - `loadtime` correlates strongest with `speedIndex`.
     - `rumSpeedIndex` has good modeling properties on visual inspection.
-    - `rumSpeedIndex` and `loadtime` have least correlation between page load metrics
+    - `rumSpeedIndex` and `loadtime` have least correlation between page load metrics.
 * `decodedBodySize` is dropped as it is very similar to `encodedBodySize`. 
-
 
 ##  Feature Generation
 
-Features were generated using [page load cycle](https://docs.google.com/document/d/1W-EREsJLuRvTPvGXaW71FvuAGXkoLNDZmZl-sbaeMZM/edit#heading=h.q9b66ketjl7j) definitions,  referring to efforts of this [bug](https://bugzilla.mozilla.org/show_bug.cgi?id=1615369), and the results of the [correlation](#corr) and [exploratory](#nav) analyses. The general idea was to focus on the page load covariates, and use the remaining timings, durations, and resource usage metrics as corrections to the model. 
+Features were generated using [page load cycle](https://docs.google.com/document/d/1W-EREsJLuRvTPvGXaW71FvuAGXkoLNDZmZl-sbaeMZM/edit#heading=h.q9b66ketjl7j) definitions,  referring to efforts of this [bug](https://bugzilla.mozilla.org/show_bug.cgi?id=1615369), and the results of the [correlation](#corr) and exploratory analyses. The general idea was to focus on the page load covariates, and use the remaining timings, durations, and resource usage metrics as corrections to the model. 
 
 * Ratio of `decodedBodySize` to `encodedBodySize`: 
     - `ratioDeEnCoded`
@@ -419,75 +524,24 @@ Features were generated using [page load cycle](https://docs.google.com/document
   - `bet_encodedBodySize`, `fet_encodedBodySize`, `rd_encodedBodySize`, `srt_encodedBodySize`
   - `encodedBodySize` is not highly correlated to any durations.
 
-```{r feature_generation, echo=FALSE}
-
-df_0220_ultra <- df_0220 %>% 
-  # ratio of de to encodedBodySize
-  mutate(ratioDeEnCoded = decodedBodySize/encodedBodySize) %>%
-  # ratio of resourceCount to encodedBodySize
-  mutate(ratioRescountEncoded = resourceCount/encodedBodySize) %>%
-  # ratio of page load to encodedBodySize
-  mutate(rsi_encodedBodySize = rumSpeedIndex/encodedBodySize) %>% 
-  mutate(rsi_resourceCount = rumSpeedIndex/resourceCount) %>%
-  mutate(lt_encodedBodySize = loadtime/encodedBodySize) %>% 
-  mutate(lt_resourceCount = loadtime/resourceCount) %>%
-  # difference of responseStart
-  mutate(rsi_responseStart = rumSpeedIndex-responseStart) %>% 
-  mutate(rsi_requestStart = rumSpeedIndex-requestStart) %>%
-  mutate(lt_responseStart = loadtime-responseStart) %>% 
-  mutate(lt_requestStart = loadtime-requestStart) %>%
-  # ratio of page load to durations 
-  mutate(rsi_backendTime = rumSpeedIndex/backendTime) %>% 
-  mutate(rsi_frontEndTime = rumSpeedIndex/frontEndTime) %>% 
-  mutate(rsi_resourceDuration = rumSpeedIndex/resourceDuration) %>%
-  mutate(rsi_serverResponseTime = rumSpeedIndex/serverResponseTime) %>%
-  mutate(lt_backendTime = loadtime/backendTime) %>% 
-  mutate(lt_frontEndTime = loadtime/frontEndTime) %>% 
-  mutate(lt_resourceDuration = loadtime/resourceDuration) %>%
-  mutate(lt_serverResponseTime = loadtime/serverResponseTime) %>%
-  # ratio of durations to encodedBodySize
-  mutate(bet_encodedBodySize = backendTime/encodedBodySize) %>% 
-  mutate(fet_encodedBodySize = frontEndTime/encodedBodySize) %>%
-  mutate(rd_encodedBodySize = resourceDuration/encodedBodySize) %>%
-  mutate(srt_encodedBodySize = serverResponseTime/encodedBodySize) 
-```
-
-```{r feature_filtering, echo=FALSE}
-df_0220_ultra_vis <- df_0220_ultra %>%
-  select(-c(responseStart, responseEnd, connectStart, domainLookupStart, domainLookupEnd, fetchStart,
-         domInteractive, DOMContentLoaded, firstPaint, 
-         decodedBodySize))
-
-df_0220_ultra_f <- df_0220_ultra_vis %>%
-  select(-c(visualComplete85, firstVisualChange, contentfulSpeedIndex, perceptualSpeedIndex)) 
-         
-```
-
-
 # Variable Importance{.tabset}
 
-To limit the numbrer of covariates utilized in model fitting to prevent overfitting, feature selection was performed on the complete covariate set. There are significant number of methods for determining variable importance. Two explored here are using [MARS](https://en.wikipedia.org/wiki/Multivariate_adaptive_regression_spline) and and the R library Boruta.
-
-<Explain resultant feature defs>
+To limit the number of covariates utilized in model training, thereby minimizes the risk of overfitting, feature selection was performed on the complete covariate set. There are significant number of methods for determining variable importance. The Two explored in this effort are using [MARS](https://en.wikipedia.org/wiki/Multivariate_adaptive_regression_spline) and and the R library Boruta.
 
 ## Mars
-Multiple adaptive regression splines (MARS) is a form of regression that is an extension of multiple linear regressions and generalized linear models.  This algorithm can be used for variable importance, as the  contribution  (e.g., variable importance  score) for each covariate can be calculated using generalized cross-validation (GCV) statistics.The table below shows the selected covariates after feature selection by MARS. 
-```{r mars, echo=FALSE, warning=FALSE, message=FALSE}
-library(earth)
-speedIndex.mars <- earth(speedIndex ~ ., data = df_0220_ultra_f %>% 
-                           select(-c(mode, url)))
-ev <- evimp (speedIndex.mars)
+Multiple adaptive regression splines (MARS) is a form of regression that is an extension of multiple linear regressions and generalized linear models.  This algorithm can be used for variable importance, as the contribution  (e.g., variable importance  score) for each covariate can be calculated using generalized cross-validation (GCV) statistics. The table below shows the selected covariates after feature selection by MARS. 
+
+```{r mars_featurs, echo=FALSE, warning=FALSE, message=FALSE}
 knitr::kable(as.data.frame(unclass(ev[,c(3,4,6)])) %>%
                tibble::rownames_to_column(., "covariate") %>%
                select(covariate, gcv)
              )
-# plot(ev)
 ```
+
 
 ## Boruta
 [Boruta](https://cran.r-project.org/web/packages/Boruta/index.html) is a feature selection algorithm that trains suites of Random Forest models to determine variable importance for regression and classification tasks. The following table shows the variable importance measures found for each navigation timing.  
 
-<explain table> 
 ```{r boruta, echo=FALSE, warning=FALSE, message=FALSE}
 speedIndex.bor <- Boruta(speedIndex ~ ., data = df_0220_ultra_f %>% 
                            select(-c(mode, url)),
@@ -505,43 +559,11 @@ knitr::kable(speedIndex.bor.df)
 
 # Modeling{.tabset}
 
-[Leave-one-out cross-validation](https://en.wikipedia.org/wiki/Cross-validation_(statistics)#Leave-one-out_cross-validation) was performed across the URLs to determine model performance. The mean absolute percentage error loss (MAPE) was calculated from the resultant predictions for each help out URL.  
+[Leave-one-out cross-validation](https://en.wikipedia.org/wiki/Cross-validation_(statistics)) was performed across the URLs to determine model performance. This is due to the strong dependency of the relationship between `speedIndex` and the navigation and resource metrics on URL. LOO CV across URL will yield the best estimation of model performance on unseen URLs.  The mean absolute percentage error loss (MAPE) was calculated from the resultant predictions for each held-out URL.  
 
 ### Mars Features
 
-```{r lm_loo, echo=FALSE, warning=FALSE}
-cv_lm_loo <- function(df, formula, response){
-  cv <- NULL
-  for (i in 1:length(urls)){
-    # train/test samples
-    train_urls <- urls[-i]
-    train <- df %>% 
-      filter(url %in% train_urls) 
-    test <- df %>% 
-      filter(!url %in% train_urls)
-    # fit model
-    lm_cv <- lm(formula = formula, data = train) 
-    cv <- rbind(cv, data.frame(response = test[[response]],
-                             prediction = predict(lm_cv, test),
-                             fold = i,
-                             url = test$url,
-                             mode = test$mode))
-  }
-  # cv <- cv %>%
-  #   mutate(residual = (prediction-response)/response)
-  return(cv)
-}
-
-cv <- cv_lm_loo(df_0220_ultra_f, 
-                      formula = speedIndex ~ rumSpeedIndex + ratioDeEnCoded + lt_encodedBodySize + lt_backendTime,
-                      response) %>%
-  gather('metric', 'value', -response, -url, -mode, -fold)
-
-mars_mape = MAPE(cv$value, cv$response)
-mars_r2 = R2()
-```
-
-CV was performed on a model trained with the top 4 features found by MARS, with a final MAPE and R2 scores of `r MAPE(cv$value, cv$response)` and `r R2(cv$value, cv$response)`.
+CV was performed on a model trained with the top 4 features found by MARS, with a final MAPE and R2 scores of `r round(MAPE(cv$value, cv$response), 2)` and `r round(R2(cv$value, cv$response), 2)`.
 
 ```{r lm_loo_plt, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
 ggplotly(ggplot(cv, aes(value, response))+
@@ -566,7 +588,7 @@ cv <- cv_lm_loo(df_0220_ultra_f,
     gather('metric', 'value', -response, -url, -mode, -fold)
 ```
 
-CV was performed on a model trained with the top 4 features found by Boruta, with a final MAPE and R2 scores of `r MAPE(cv$value, cv$response)` and `r R2(cv$value, cv$response)`. Interestingly, Boruta's selected feature perform significantly worse than MARS, which could be due to using decision trees instead of linear regression models. 
+CV was performed on a model trained with the top 4 features found by Boruta, with a final MAPE and R2 scores of `r round(MAPE(cv$value, cv$response), 2)` and `r round(R2(cv$value, cv$response), 2)`. Interestingly, Boruta's selected feature perform significantly worse than MARS, which could be due to using decision trees instead of linear regression models. 
 
 ```{r lm_loo_boruta_plt, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
 ggplotly(ggplot(cv, aes(value, response)) +
@@ -612,7 +634,7 @@ cv <- cv_lm_loo(df_0220_ultra_f,
 
 ```
 
-LOO CV using these features yeilds a MAPE and R2 scores of `r MAPE(cv$value, cv$response)` and `r R2(cv$value, cv$response)`, respectively. The MAPE score is higher than that found with features including `rumSpeedIndex`, suggesting weaker model performance and a poorer resultant fit. 
+LOO CV using these features yeilds a MAPE and R2 scores of `r round(MAPE(cv$value, cv$response), 2)` and `r round(R2(cv$value, cv$response), 2)`, respectively. The MAPE score is higher than that found with features including `rumSpeedIndex`, suggesting weaker model performance and a poorer resultant fit. 
 
 ```{r loo_cv_val_plt, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
 ggplotly(ggplot(cv, aes(value, response)) +
@@ -631,32 +653,7 @@ ggplotly(ggplot(cv, aes(value, response)) +
 
 ## Validation
 
-```{r lm_val_model_fit, echo=FALSE, warning=FALSE}
-lm.val <- lm(speedIndex ~ loadtime + ratioDeEnCoded + lt_encodedBodySize + resourceCount, data = df_0220_ultra_f)
-
-df.val <- df_0120 %>%
-  # ratio of de to encodedBodySize
-  mutate(ratioDeEnCoded = decodedBodySize/encodedBodySize) %>%
-  # ratio of page load to encodedBodySize
-  mutate(lt_encodedBodySize = loadtime/encodedBodySize) %>% 
-  mutate(lt_resourceCount = loadtime/resourceCount) %>%
-  # difference of responseStart
-  mutate(lt_responseStart = loadtime-responseStart) %>% 
-  mutate(lt_requestStart = loadtime-requestStart) %>%
-  # ratio of page load to durations 
-  mutate(lt_backendTime = loadtime/backendTime) %>% 
-  mutate(lt_frontEndTime = loadtime/frontEndTime) %>% 
-  mutate(lt_resourceDuration = loadtime/resourceDuration) %>%
-  mutate(lt_serverResponseTime = loadtime/serverResponseTime) %>%
-  # ratio of durations to encodedBodySize
-  mutate(bet_encodedBodySize = backendTime/encodedBodySize) %>% 
-  mutate(fet_encodedBodySize = frontEndTime/encodedBodySize) %>%
-  mutate(rd_encodedBodySize = resourceDuration/encodedBodySize) %>%
-  mutate(srt_encodedBodySize = serverResponseTime/encodedBodySize) %>%
-  mutate(predictions = predict(lm.val, .))
-```
-
-The validation MAPE and R2 scores are `r MAPE(df.val$predictions, df.val$speedIndex)` and `r R2(df.val$predictions, df.val$speedIndex)`, respectively. There is a strong dependency of model performance with URL, where https://imgur.com is not adequately explained by the model. 
+The validation MAPE and R2 scores are `r round(MAPE(df.val$predictions, df.val$speedIndex), 2)` and `r round(R2(df.val$predictions, df.val$speedIndex), 2)`, respectively. There is a strong dependency of model performance with URL, as noted previously. https://imgur.com is an especially pathological case.
 
 ```{r lm_val_model_fit_plt, fig.width=5, fig.height=5, echo=FALSE, warning=FALSE}
 
@@ -674,6 +671,8 @@ ggplotly(
 ```
 
 # Visual Metrics{.tabset}
+
+The focus of the modeling tasks was on `speedIndex`. However, there were `r length(visual_metrics)` measured in the two datasets. The following plots show the relationships between the various visual metrics and the top covariates found by MARS. In general, the trends observed for each URL hold across the various visual metrics. Therefore, the choice of visual metric for modeling appears to be of less significance, than the variety of URLs measured.  
 
 ## `rumSpeedIndex` Features
 ```{r vis_met_comp_1, fig.width=10, fig.height=10, echo=FALSE}
@@ -717,23 +716,11 @@ ggplotly(
 
 # Next Steps
 
-1. Determine which visual metric to focus upon
-1. Acquire significantly more live sites
-2. Utilize RFE, with resampling across URLs to determine optimal feature set.
-3. Examine additional regression modeling techinques.
-4. Weighted regression to deal with URL splitting. Very little data in middel. 
-3. Additional metrics to determine differences observed
-   - specific URLs
-   
-# Cut
-Questions?
-* What covariates are in Webpagetest, relative to those used in model?
+The following steps should be taken to produce a production grade model for use in telemetry:
 
-Focus:
-* On second drop dataset. 
-  - rumtimings helpful but not the best
-* Webpagetest is useful how?
+1. Determine the optimal visual metric for measuring in telemetry. This should best represent user perceived page load performance. 
+2. Measure significantly more live URLs, with ~100 being a good starting point. 
+3. Measure across desktop and mobile platforms. 
+4. Utilize recursive feature selection, with resampling across URLs to determine optimal feature set.
+5. Once a larger, more thorough dataset is obtained, examine additional regression modeling techniques. 
 
-* data cleaning: note that there is an anomalous point at large domcontentloaded
-
-* LOO best option: data is all clustered by URL. Therefore, need to CV around URL to get best estimation of model prediction performance. Otherwise, we are transfering information. 
