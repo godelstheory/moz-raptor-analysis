@@ -297,7 +297,7 @@ lcp_lt_res <- model_and_eval(features_lt, df_feat_lt, 'largestContentfulPaint.lo
 
 [Largest Contentful Paint](https://github.com/WICG/largest-contentful-paint)(LCP) is a new page load metric that aims to be more representative of a user experience than "traditional" page load metrics. This is similar to visual metrics; however, LCP can be measured both in the lab and "in-the-wild". This report expands upon [previous work](https://metrics.mozilla.com/protected/cdowhygelund/visual_metrics_modeling.html), determining how well LCP, in addition to linear models of current page load and navigation metrics, predict visual metrics (`r paste(vis_metrics, sep='', collapse=', ')`). Linear regression models were trained on a Chrome-specific dataset of `r num_uri` URLs each ran five times. 
 
-`largestContentfulPaint.renderTime` yields the best predictor of all visual metrics tested, though fails to be calculated for `r nrow(lcp_url_rt_fails)` URLs. The MAPE score of this feature is lower by `r delta_min*100`-`r delta_max*100`% with respect to `rumSpeedIndex`. Conversely, `largestContentfulPaint.loadTime` is inferior to `rumSpeedIndex`, yielding higher MAPE scores for all visual metrics. 
+`largestContentfulPaint.renderTime` yields the best predictor of all visual metrics tested, though fails to be calculated for `r nrow(lcp_url_rt_fails)` URLs. The mean absolute percentage error loss (MAPE) score of this feature is lower by `r delta_min*100`-`r delta_max*100`% with respect to `rumSpeedIndex`. Conversely, `largestContentfulPaint.loadTime` is inferior to `rumSpeedIndex`, yielding higher MAPE scores for all visual metrics. 
 
 # Dataset{.tabset}
 
@@ -306,7 +306,7 @@ A single dataset was provided by Andrew Creskey that contained in-house, live-si
 * `largestContentfulPaint.renderTime`
 * `largestContentfulPaint.loadTime`
 
-The dataset was composed of `r length(unique(df$url))` URLs, each run five times. Two URLs were run four times (`r paste(df %>% count(url) %>% filter(n==4) %>% mutate(url_str = as.character(url)) %>% pull , sep=' ', collapse=', ')`).
+The dataset was composed of `r num_uri` URLs, each run five times. Two URLs were run four times (`r paste(df_orig %>% count(url) %>% filter(n==4) %>% mutate(url_str = as.character(url)) %>% pull , sep=' ', collapse=', ')`).
 
 
 ## Navigation Timings
