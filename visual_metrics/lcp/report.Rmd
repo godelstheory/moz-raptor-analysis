@@ -1,0 +1,440 @@
+---
+title: "Visual Metrics And Navigation Timings: LCP"
+author: "Corey Dow-Hygelund, Mozilla Data Science"
+date: 'Last Updated: `r format(Sys.time(), "%B %d, %Y")`'
+output: 
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+---
+
+```{r library_imports, message=FALSE, warning=FALSE, echo=FALSE}
+library(corrplot)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(funModeling)
+library(cowplot)
+library(ggridges)
+library(Boruta)
+library(viridis)
+library(stringr)
+library(plotly)
+library(earth)
+library(MLmetrics)
+```
+
+```{r load, echo=FALSE, warning=FALSE, message=FALSE}
+load('data/Chrome_lcp.RData')
+
+df <- df %>%
+  mutate(mode = as.factor(mode)) %>%
+  mutate(url = as.factor(url))
+
+df_orig <- df
+
+visual_metrics <- sort(
+  c(
+    'firstVisualChange',
+    'visualComplete85',
+    'speedIndex',
+    'contentfulSpeedIndex',
+    'perceptualSpeedIndex'
+    )
+)
+
+nav_timings <- sort(names(df)[!names(df) %in% c('mode', 'url', visual_metrics)])
+
+df_long <- df %>%
+  gather('vis_metric', 'vis_metric_value', -all_of(nav_timings), -mode, -url) %>%
+  gather('nav_timing', 'nav_timing_value', -vis_metric, -vis_metric_value, -mode, -url)
+
+vis_metrics <- c('visualComplete85', 'perceptualSpeedIndex', 'speedIndex')
+vis_metrics_filter <- visual_metrics[!visual_metrics %in% vis_metrics]
+
+num_uri <- length(unique(df$url))
+```
+
+```{r lcp_fails, echo=FALSE, warning=FALSE, message=FALSE}
+lcp_url_fails <- df_orig %>%
+  filter((`largestContentfulPaint.renderTime`==0) | (`largestContentfulPaint.loadTime`==0)) %>%
+  count(url) 
+
+lcp_url_rt_fails <- lcp_url_fails <- df_orig %>%
+  filter((`largestContentfulPaint.renderTime`==0) ) %>%
+  count(url) 
+
+lcp_url_lt_fails <- lcp_url_fails <- df_orig %>%
+  filter((`largestContentfulPaint.loadTime`==0) ) %>%
+  count(url) 
+
+lcp_odd_fails <- lcp_url_fails %>% filter(n < 5)
+
+url_fails <- df_orig %>% filter(url %in% lcp_odd_fails$url) %>% distinct(url)
+```
+
+```{r nav_timing_states, echo=FALSE, warning=FALSE, message=FALSE}
+df_state <- df_status(df %>% select(all_of(nav_timings)), print_results=FALSE)
+
+dropped_covars <- df_state %>%
+  filter((q_zeros > 0) | (q_na > 0)) %>%
+  pull(variable)
+```
+
+```{r df_model_cleaning, echo=FALSE, warning=FALSE, message=FALSE}
+df <- df %>%
+  filter(encodedBodySize > 0)
+
+df_rt <- df %>%
+  filter(`largestContentfulPaint.renderTime` > 0)
+
+df_rt_long <- df_rt %>%
+  gather('vis_metric', 'vis_metric_value', -all_of(nav_timings), -mode, -url) %>%
+  gather('nav_timing', 'nav_timing_value', -vis_metric, -vis_metric_value, -mode, -url)
+
+df_lt <- df %>%
+  filter(`largestContentfulPaint.loadTime` > 0)
+
+df_lt_long <- df_lt %>%
+  gather('vis_metric', 'vis_metric_value', -all_of(nav_timings), -mode, -url) %>%
+  gather('nav_timing', 'nav_timing_value', -vis_metric, -vis_metric_value, -mode, -url)
+
+```
+
+```{r feature_sets, echo=FALSE, warning=FALSE, message=FALSE}
+gen_features <- function(df){
+  df_feat <- df %>% 
+    # ratio of de to encodedBodySize
+    mutate(ratioDeEnCoded = decodedBodySize/encodedBodySize) %>%
+    # ratio of resourceCount to encodedBodySize
+    # mutate(ratioRescountEncoded = resourceCount/encodedBodySize) %>%
+    # ratio of page load to encodedBodySize
+    mutate(rsi_encodedBodySize = rumSpeedIndex/encodedBodySize) %>% 
+    # mutate(rsi_resourceCount = rumSpeedIndex/resourceCount) %>%
+    mutate(lt_encodedBodySize = loadtime/encodedBodySize) %>% 
+    # mutate(lt_resourceCount = loadtime/resourceCount) %>%
+    # difference of responseStart
+    mutate(rsi_responseStart = rumSpeedIndex-responseStart) %>% 
+    mutate(rsi_requestStart = rumSpeedIndex-requestStart) %>%
+    mutate(lt_responseStart = loadtime-responseStart) %>% 
+    mutate(lt_requestStart = loadtime-requestStart) %>%
+    # ratio of page load to durations 
+    mutate(rsi_backendTime = rumSpeedIndex/backendTime) %>% 
+    mutate(rsi_frontEndTime = rumSpeedIndex/frontEndTime) %>% 
+    # mutate(rsi_resourceDuration = rumSpeedIndex/resourceDuration) %>%
+    mutate(rsi_serverResponseTime = rumSpeedIndex/serverResponseTime) %>%
+    mutate(lt_backendTime = loadtime/backendTime) %>% 
+    mutate(lt_frontEndTime = loadtime/frontEndTime) %>% 
+    # mutate(lt_resourceDuration = loadtime/resourceDuration) %>%
+    mutate(lt_serverResponseTime = loadtime/serverResponseTime) %>%
+    # ratio of durations to encodedBodySize
+    mutate(bet_encodedBodySize = backendTime/encodedBodySize) %>% 
+    mutate(fet_encodedBodySize = frontEndTime/encodedBodySize) %>%
+    # mutate(rd_encodedBodySize = resourceDuration/encodedBodySize) %>%
+    mutate(srt_encodedBodySize = serverResponseTime/encodedBodySize) 
+  
+  df_feat_c <- df_feat %>%
+    select(-c(responseStart, responseEnd, connectStart, domainLookupStart, domainLookupEnd, fetchStart,
+           domInteractive, DOMContentLoaded, firstPaint, 
+           decodedBodySize, resourceCount, resourceDuration,
+           redirectionTime, domainLookupTime, serverConnectionTime))
+  return(df_feat_c)  
+}
+
+df_feat_rt <- gen_features(df_rt) %>%
+  select(-`largestContentfulPaint.loadTime`)
+
+df_feat_lt  <- gen_features(df_lt) %>%
+  select(-`largestContentfulPaint.renderTime`)
+```
+
+```{r modeling_arch, echo=FALSE, warning=FALSE, message=FALSE}
+cv_lm_loo <- function(df, formula, response){
+  urls = unique(df$url)
+  cv <- NULL
+  for (i in 1:length(urls)){
+    # train/test samples
+    train_urls <- urls[-i]
+    train <- df %>% 
+      filter(url %in% train_urls) 
+    test <- df %>% 
+      filter(!url %in% train_urls)
+    # fit model
+    lm_cv <- lm(formula = formula, data = train) 
+    cv <- rbind(cv, data.frame(response = test[[response]],
+                             prediction = predict(lm_cv, test),
+                             fold = i,
+                             url = test$url,
+                             mode = test$mode))
+  }
+  return(cv)
+}
+
+generate_formula <- function(tr_cov, label, add_interactions=FALSE){
+  if (add_interactions){
+    formula <- paste(label, '~', paste(tr_cov, collapse="*"))
+  }
+  else {
+    formula <- paste(label, '~', paste(tr_cov, collapse="+"))
+  }
+  # return(as.formula(formula))
+  return(as.formula(formula))
+}
+
+run_loo_cv <- function(df, resp, cov){
+  cv <- cv_lm_loo(df, 
+                formula = generate_formula(cov, resp),
+                      resp) %>%
+    gather('metric', 'value', -response, -url, -mode, -fold)
+  return(list(cv = cv, mape = MAPE(cv$value, cv$response)))
+}
+```
+  
+```{r feature_arch, echo=FALSE, warning=FALSE, message=FALSE}
+features_rt <- list() # list('largestContentfulPaint.renderTime', 'rumSpeedIndex', 'loadTime')
+features_lt <- list() #list('largestContentfulPaint.loadTime')
+
+gen_features <- function(df, resp){  
+  features <- list()
+  df_clean <- df %>% 
+                  select(-c(mode, url)) %>% # select(-c(mode, url)) %>%
+                  select(-c(vis_metrics)) %>%
+                  select(-c(all_of(vis_metrics_filter)))
+  # mars
+  mars <- earth(x = df_clean, y = df %>% pull(resp))
+  ev <- evimp(mars)
+  features[['mars']] <- ev
+  
+  # boruta
+  bor <- Boruta(x = df_clean, y = df %>% pull(resp)) #, doTrace = TRUE, ntree = 500, maxRuns = 1000)
+
+  bor.df <- attStats(bor) %>%
+    tibble::rownames_to_column(., 'covariate') %>%
+    arrange(desc(medianImp)) %>%
+    select(covariate, meanImp, medianImp)
+  features[['boruta']] <- bor.df
+  return(features)
+}
+
+extract_features <- function(features, additional){
+  feat_f <- list()
+  for(vis_metric in names(features)){
+    # mars
+    mars <- rownames(features[[vis_metric]][['mars']])[1:4]
+    # boruta
+    bor <- (features[[vis_metric]][['boruta']] %>% pull(covariate))[1:4]
+    feat_f[[vis_metric]] <- list(
+      'lcp' = additional, 
+      'rumSpeedIndex' = c('rumSpeedIndex'),
+      'loadtime' = c('loadtime'),
+      'MARS' = mars,
+      'Boruta' = bor)
+  }
+  return(feat_f)
+}
+
+model_and_eval <- function(features, df, lcp){
+  feats <- extract_features(features, lcp)
+  results <- list()
+  for (vis_metric in names(feats)){
+    for (feat_gp in names(feats[[vis_metric]])){
+      results[[vis_metric]][[feat_gp]] <- run_loo_cv(df, vis_metric, feats[[vis_metric]][[feat_gp]])
+    }
+  }
+  return(results)
+}
+
+extract_mape <- function(results){
+  vis_metrics <- names(results)
+  feat_gps <- names(results[[vis_metrics[1]]])
+  mapes <- data.frame(matrix(ncol=length(feat_gps),nrow=0, dimnames=list(NULL, feat_gps)))
+  mapes <- list()
+  for (vis_metric in vis_metrics){
+    vis_m_mape <- c()
+    for (feat_gp in feat_gps){
+      vis_m_mape[feat_gp] = results[[vis_metric]][[feat_gp]][['mape']]
+    }
+    # mapes[[vis_metric]] <- t(setNames(data.frame(vis_m_mape), c(vis_metric)))
+    mapes <- rbind(mapes, t(setNames(data.frame(vis_m_mape), c(vis_metric))))
+  }
+  return(mapes)
+}
+
+extract_vis_features <- function(features){
+  vis_metrics <- names(features)
+  feats <- data.frame(matrix(ncol=length(2),nrow=0, dimnames=list(NULL, 2)))
+  feats <- list()
+  for (vis_metric in vis_metrics){
+    vis_m_feats <- c(MARS = paste(rownames(features[[vis_metric]][['mars']])[1:4], sep = '', collapse = ', '),
+                     Boruta = paste((features[[vis_metric]][['boruta']] %>% pull(covariate))[1:4], sep = '', collapse = ', '))
+    # mapes[[vis_metric]] <- t(setNames(data.frame(vis_m_mape), c(vis_metric)))
+    feats <- rbind(feats, t(setNames(data.frame(vis_m_feats), c(vis_metric))))
+  }
+  return(feats)
+}
+for (vis_metric in vis_metrics){
+  features_rt[[vis_metric]] <- gen_features(df_feat_rt, vis_metric)
+  features_lt[[vis_metric]] <- gen_features(df_feat_lt, vis_metric)
+}
+```
+
+```{r lcp_rt_modeling, echo=FALSE, message=FALSE, warning=FALSE}
+lcp_rt_res <- model_and_eval(features_rt, df_feat_rt, 'largestContentfulPaint.renderTime')
+
+mape_lcp <- as.data.frame(extract_mape(lcp_rt_res)) %>% pull(lcp) %>%  unlist()
+mape_rum <- as.data.frame(extract_mape(lcp_rt_res)) %>% pull(rumSpeedIndex) %>%  unlist()
+delta_max <- round(max((mape_rum - mape_lcp) / mape_rum), 2) 
+delta_min <- round(min((mape_rum - mape_lcp) / mape_rum), 2)
+```
+
+```{r lcp_lt_modeling, echo=FALSE, message=FALSE, warning=FALSE}
+lcp_lt_res <- model_and_eval(features_lt, df_feat_lt, 'largestContentfulPaint.loadTime')
+```
+
+
+# tl;dr
+
+[Largest Contentful Paint](https://github.com/WICG/largest-contentful-paint)(LCP) is a new page load metric that aims to be more representative of a user experience than "traditional" page load metrics. This is similar to visual metrics; however, LCP can be measured both in the lab and "in-the-wild". This report expands upon [previous work](https://metrics.mozilla.com/protected/cdowhygelund/visual_metrics_modeling.html), determining how well LCP, in addition to linear models of current page load and navigation metrics, predict visual metrics (`r paste(vis_metrics, sep='', collapse=', ')`). Linear regression models were trained on a Chrome-specific dataset of `r num_uri` URLs each ran five times. 
+
+`largestContentfulPaint.renderTime` yields the best predictor of all visual metrics tested, though fails to be calculated for `r nrow(lcp_url_rt_fails)` URLs. The MAPE score of this feature is lower by `r delta_min*100`-`r delta_max*100`% with respect to `rumSpeedIndex`. Conversely, `largestContentfulPaint.loadTime` is inferior to `rumSpeedIndex`, yielding higher MAPE scores for all visual metrics. 
+
+# Dataset{.tabset}
+
+A single dataset was provided by Andrew Creskey that contained in-house, live-site testing of Chrome across a range of URLs, to determine the efficacy of LCP. The dataset is similarly formatted as [here](https://metrics.mozilla.com/protected/cdowhygelund/visual_metrics_modeling.html#datasets), with the inclusion of the two LCP metrics. `largestContentfulPaint.renderTime` is the most accurate method when available.
+
+* `largestContentfulPaint.renderTime`
+* `largestContentfulPaint.loadTime`
+
+The dataset was composed of `r length(unique(df$url))` URLs, each run five times. Two URLs were run four times (`r paste(df %>% count(url) %>% filter(n==4) %>% mutate(url_str = as.character(url)) %>% pull , sep=' ', collapse=', ')`).
+
+
+## Navigation Timings
+Several of the navigation metrics are not accurately measured across URLs: `r paste(dropped_covars, sep=', ')`. 
+
+This includes the LCP metrics. 
+
+```{r nav_timings, echo=FALSE}
+knitr::kable(df_state)
+```
+
+### LCP Metrics
+
+* `largestContentfulPaint.renderTime` fails for `r lcp_url_rt_fails %>% nrow()` URLs. 
+* `largestContentfulPaint.loadTime` fails for `r lcp_url_lt_fails %>% nrow()` URLs. 
+
+Interestingly, only `r length(url_fails)` out of `r lcp_url_rt_fails %>% nrow()` URLs that fail on `largestContentfulPaint.renderTime` have a successful measurement. Also, URLs that fail on the secondary option `largestContentfulPaint.loadTime` _do not_ fail for `largestContentfulPaint.renderTime`.
+
+
+## Visual Metrics
+```{r vis_metric_state, echo=FALSE, warning=FALSE, message=FALSE}
+df_vis_state <- df_status(df %>% select(all_of(visual_metrics)), print_results=FALSE)
+```
+
+`contentFulSpeedIndex` appears to not be measured in Chrome. `firstVisualChange` has unusual behavior with only `r df_vis_state %>% filter(variable == 'firstVisualChange') %>% pull(unique)` unique values. 
+```{r vis_metrics, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::kable(df_vis_state)
+```
+
+```{r vis_metric_distr, fig.width=8, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE}
+df_long_vis <- df %>%
+  select(mode, url, vis_metrics) %>%
+  gather('vis_metric', 'value', -mode, -url)
+
+# ps = list()
+#ps[['ridge']] <- 
+ggplot(df_long_vis, aes(x=value, y=vis_metric, fill = factor(stat(quantile)))) +
+  stat_density_ridges(
+    geom = "density_ridges_gradient", calc_ecdf = TRUE,
+    quantiles = 5, quantile_lines = TRUE
+  ) +
+  scale_fill_viridis_d(name = "Quintiles") +
+  theme(axis.text.y = element_text(angle = 25, hjust = 1)) +
+  xlim(0, 10000) + 
+  theme_bw() +
+  ylab('Visual Metric') +
+  xlab('Time (ms)')
+```
+
+# Visualize
+The following interactive plots display the visual metrics versus the specific page load metrics. Color represents url.
+The empty values were filtered for each LCP metric. 
+
+`largestContentfulPaint.renderTime` appears to trend better for each visual metric than `loadtime` or `rumSpeedIndex`. Specifically, the metric has an extended, less clumped, distribution for low values than `loadtime` and `rumSpeedIndex`. `largestContentfulPaint.loadTime` is similar; though is has significantly more outliers than its counterpart. 
+
+```{r visualize, fig.width=10, fig.height=5, echo=FALSE, message = FALSE, warning=FALSE}
+ggplotly(
+  ggplot(df_long %>% 
+           filter(nav_timing %in% c('rumSpeedIndex', 'loadtime', 'largestContentfulPaint.loadTime', 'largestContentfulPaint.renderTime')) %>%
+           filter((nav_timing == 'largestContentfulPaint.loadTime' & nav_timing_value !=0) | (nav_timing != 'largestContentfulPaint.loadTime')) %>%
+           filter((nav_timing == 'largestContentfulPaint.renderTime' & nav_timing_value !=0) | (nav_timing != 'largestContentfulPaint.renderTime')) %>%
+           filter(!vis_metric %in% c('contentfulSpeedIndex', 'firstVisualChange')),
+         aes(nav_timing_value, vis_metric_value)) +
+    facet_grid(vars(vis_metric), vars(nav_timing), scales='free') + 
+    geom_point(aes(color = url, shape=mode)) +
+    geom_smooth(method = "lm", se = FALSE) + 
+    theme_bw() + 
+    theme(legend.position = "top") +
+    xlab('Navigation Timing Value') + 
+    ylab('Visual Metric Value') + 
+    theme(legend.position = "none")
+)
+```
+
+
+# Modeling
+A realistic assessment of these metrics was performed using leaving-one-out CV across the range of URLs as described [here](https://metrics.mozilla.com/protected/cdowhygelund/visual_metrics_modeling.html#modeling). The same feature set was used as that work, though the additional features with empty values were stripped (e.g. `rd_encodedBodySize`, `ratioRescountEncoded`). In addition the five empty `encodedBodySize` records were filtered, though the feature was kept.
+
+Two different dataset were modeled, due to the missing LCP values. This resulted in two different sets of URLs being tested in LOO CV.
+
+
+* LCP: RenderTime - `largestContentfulPaint.renderTime > 0`
+* LCP: LoadTime - `largestContentfulPaint.loadTime > 0` 
+
+Five feature sets were modeled:
+
+* `largestContentfulPaint.renderTime` or `largestContentfulPaint.loadTime`
+    - Based upon the dataset modeled.
+* `rumSpeedIndex`
+* `loadtime`
+* Top four features selected by [MARS](https://en.wikipedia.org/wiki/Multivariate_adaptive_regression_spline)
+* Top four features selected by [Boruta](https://cran.r-project.org/web/packages/Boruta/index.html)
+
+As previously, mean absolute percentage error loss (MAPE) was calculated to rank the models. Less prediction error leads to lower MAPE scores.
+
+## LCP: RenderTime{.tabset}
+### Features
+The following table shows the results MARS and Boruta features selected for each visual metric.
+
+```{r lcp_rt_final_feats, echo=FALSE}
+knitr::kable(extract_vis_features(features_rt))
+```
+
+
+### MAPE
+The following table shows the resultant MAPE scores for LCP: RenderTime dataset. 
+
+`largestContentfulPaint.renderTime` has the lowest MAPE for all visual metrics. 
+
+
+```{r lcp_rt_mape, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::kable(extract_mape(lcp_rt_res))
+```
+
+## LCP: LoadTime{.tabset}
+The following table shows the results MARS and Boruta features selected for each visual metric.
+
+### Features
+```{r lcp_lt_final_feats, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::kable(extract_vis_features(features_lt))
+```
+
+### MAPE
+The following table shows the resultant MAPE scores for LCP: LoadTime dataset. 
+
+Unlike `largestContentfulPaint.renderTime`, `largestContentfulPaint.loadTime` results in a an inferior model compared to those using `rumSpeedIndex`. Both the single `rumSpeedIndex` feature model, and the composite feature model from Boruta, both result in significantly lower MAPE scores for all visual metrics. 
+
+
+```{r lcp_lt_mape, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::kable(extract_mape(lcp_lt_res))
+```
