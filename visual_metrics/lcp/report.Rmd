@@ -348,10 +348,34 @@ extract_cv_calc_mape <- function(results_1, results_2){
   return(list(mapes = mapes, cvs = cvs))
 }
 
-extract_cv_calc_mape_cmp <- function(results_1, results_2){
+extract_lcp_calc_mape <- function(results_1, results_2){
   vis_metrics <- names(results_1)
   feat_gps <- names(results_1[[vis_metrics[1]]])
   mapes <- data.frame(matrix(ncol=length(feat_gps),nrow=0, dimnames=list(NULL, feat_gps)))
+  cvs <- list()
+  # mapes <- list()
+  for (vis_metric in vis_metrics){
+    vis_m_mape <- c()
+    feat_gp <- 'lcp'
+    lcp_rs <- results_1[[vis_metric]][['lcp']][['cv']]
+    # print(results_2)
+    cv <- results_2[[vis_metric]][[feat_gp]][['cv']] %>%
+      filter(!url %in% unique(lcp_rs$url)) %>%
+      bind_rows(lcp_rs)
+    # vis_m_mape[feat_gp] <- results_1[[vis_metric]][[feat_gp]][['mape']] # MAPE(cv$value, cv$response)
+    vis_m_mape[feat_gp] <-  MAPE(cv$value, cv$response)
+    cvs[[vis_metric]][[feat_gp]] <- cv
+    # mapes[[vis_metric]] <- t(setNames(data.frame(vis_m_mape), c(vis_metric)))
+    mapes <- rbind(mapes, t(setNames(data.frame(vis_m_mape), c(vis_metric))))
+  }
+  return(list(mapes = mapes, cvs = cvs))
+}
+
+
+extract_cv_calc_mape_cmp <- function(results_1, results_2){
+  vis_metrics <- names(results_1)
+  feat_gps <- names(results_1[[vis_metrics[1]]])
+  # mapes <- data.frame(matrix(ncol=length(feat_gps),nrow=0, dimnames=list(NULL, feat_gps)))
   cvs <- list()
   # mapes <- list()
   for (vis_metric in vis_metrics){
@@ -372,7 +396,7 @@ extract_cv_calc_mape_cmp <- function(results_1, results_2){
       # print(results_2)
     }
     # mapes[[vis_metric]] <- t(setNames(data.frame(vis_m_mape), c(vis_metric)))
-    mapes <- rbind(mapes, t(setNames(data.frame(vis_m_mape), c(vis_metric))))
+    mapes <- setNames(t(data.frame(vis_m_mape)), c(vis_metric))
   }
   return(list(mapes = mapes, cvs = cvs))
 }
@@ -385,6 +409,10 @@ mapes_rs <- extract_mape(lcp_rs_res)
 mapes_delta <- (mapes_rs - mapes_full$mapes)/mapes_rs
 ```
 
+```{r lcp_rt_lt_result_tbl, echo=FALSE}
+mapes_lcp_full <- extract_lcp_calc_mape(lcp_rt_res, lcp_lt_res)
+mapes_lcp_full_delta <- (mapes_rs - mapes_lcp_full$mapes %>% pull(lcp))/mapes_rs
+```
 
 # tl;dr
 
@@ -392,7 +420,7 @@ mapes_delta <- (mapes_rs - mapes_full$mapes)/mapes_rs
 
 `largestContentfulPaint.renderTime` yields the best predictor of all visual metrics tested, though fails to be calculated for `r nrow(lcp_url_rt_fails)` URLs. The mean absolute percentage error loss (MAPE) score of this feature is lower by `r delta_min*100`-`r delta_max*100`% with respect to `rumSpeedIndex`. Conversely, `largestContentfulPaint.loadTime` is inferior to `rumSpeedIndex`, yielding higher MAPE scores for all visual metrics. 
 
-A composite model using `largestContentfulPaint.renderTime` for cases when it is measured, while defaulting to `rumSpeedIndex` for failed URLs, yields the lowest MAPE scores. This model has `r round(min(mapes_delta$rumSpeedIndex), 2)*100` - `r round(max(mapes_delta$rumSpeedIndex), 2)*100`% improvement in predicting the visual metrics, with respect to `rumSpeedIndex` alone. 
+A composite model using `largestContentfulPaint.renderTime` for cases when it is measured, while defaulting to `rumSpeedIndex` for failed URLs, yields the lowest MAPE scores. This model has `r round(min(mapes_delta$rumSpeedIndex), 2)*100` - `r round(max(mapes_delta$rumSpeedIndex), 2)*100`% improvement in predicting the visual metrics, with respect to `rumSpeedIndex` alone. A similar model, which resorts to `largestContentfulPaint.loadTime` for these failed cases has significantly poorer performance, and for two visual metrics performs worse than `rumSpeedIndex` alone (-33% for `visualComplete85` and -13% for `speedIndex`).
 
 # Dataset{.tabset}
 
@@ -538,9 +566,11 @@ knitr::kable(round(extract_mape(lcp_lt_res), 2))
 ```
 
 ## Complete
-This model is a composite of two, designed to handle cases where `largestContentfulPaint.renderTime` is not calculated. For URLs where `largestContentfulPaint.renderTime > 0`, a linear model for `largestContentfulPaint.renderTime` is fit. 
+These models are a composite of two, designed to handle cases where `largestContentfulPaint.renderTime` is not calculated. For URLs where `largestContentfulPaint.renderTime > 0`, a linear model for `largestContentfulPaint.renderTime` is fit. 
 
-The second model, composed of the remaining covariates, is fit on all URLs, including those where `largestContentfulPaint.renderTime > 0`. However, it is only used to predict cases where `largestContentfulPaint.renderTime == 0`. 
+The second part of the first composite model uses the `largestContentfulPaint.loadTime` model fits above when `largestContentfulPaint.renderTime == 0`. 
+
+The second composite model, fits the non-LCP covariates on all URLs, including those where `largestContentfulPaint.renderTime > 0`. This model is used to predict cases where `largestContentfulPaint.renderTime == 0`. 
 
 ### Features
 The table shows the features (excluding LCP) selected using all URLs. 
@@ -551,11 +581,33 @@ knitr::kable(extract_vis_features(features_rs))
 
 ### MAPE{.tabset}
 
+#### LCP: RenderTime + LCP: LoadTime
+MAPE scores for `largestContentfulPaint.renderTime` + `largestContentfulPaint.loadTime` composite models:
+
+```{r lcp_rt_lt_l_mape, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::kable(round(mapes_lcp_full$mapes, 2))
+```
+
+##### Improvement
+Fractional improvement with respect to non-LCP `rumSpeedIndex`-based models. The fractional improvement was calculated using from comparing the MAPE scores above to those of each feature group.
+
+```{r lcp_improve_mape_rt_lt, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::kable(round(mapes_lcp_full_delta, 2))
+```
+
+
 #### LCP + rumSpeedIndex
-MAPE scores for composite model:
+MAPE scores for `largestContentfulPaint.renderTime` + `rumSpeedIndex` composite models:
 
 ```{r lcp_full_mape, echo=FALSE, message=FALSE, warning=FALSE}
 knitr::kable(round(mapes_full$mapes, 2))
+```
+
+##### Improvement
+Fractional improvement with respect to non-LCP `rumSpeedIndex`-based models. The fractional improvement was calculated comparing each identical feature group: 
+
+```{r lcp_improve_mape, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::kable(round(mapes_delta, 2))
 ```
 
 #### rumSpeedIndex
@@ -564,9 +616,4 @@ MAPE scores for non-LCP based models:
 knitr::kable(round(mapes_rs, 2))
 ```
 
-#### Improvement
-Fractional improvement in using `largestContentfulPaint.renderTime`:
 
-```{r lcp_improve_mape, echo=FALSE, message=FALSE, warning=FALSE}
-knitr::kable(round(mapes_delta, 2))
-```
